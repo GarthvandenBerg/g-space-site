@@ -13,7 +13,12 @@
   <header class="navbar">
     <div class="container nav-content">
       <a href="#" class="logo">g-space<span class="dot">.co.za</span></a>
-      <nav>
+      <button class="hamburger" id="hamburgerBtn" aria-label="Toggle Navigation">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
+      <nav id="navMenu">
         <a href="#posts">Articles</a>
         <a href="#about">About</a>
       </nav>
@@ -37,34 +42,37 @@
       </div>
     </section>
 
-    <section id="posts" class="posts-grid">
-      <article class="post-card" data-tags="kubernetes gitops">
-        <div class="card-meta">
-          <span class="date">2026-08-25</span>
-          <span class="read-time">5 min read</span>
-        </div>
-        <h2>Automating Image Updates with Renovate and ArgoCD</h2>
-        <p>A look into pushing static build artifacts to container registries and triggering seamless GitOps deployments with Argo CD Image Updater.</p>
-        <div class="card-tags">
-          <span class="tag">#kubernetes</span>
-          <span class="tag">#gitops</span>
-        </div>
-      </article>
+    <section id="posts" class="posts-grid"></section>
 
-      <article class="post-card" data-tags="homelab kubernetes">
-        <div class="card-meta">
-          <span class="date">2026-08-18</span>
-          <span class="read-time">8 min read</span>
+    <section id="about" class="about-section">
+      <div class="about-card">
+        <h2>About G-SPACE</h2>
+        <p>I am a Systems & DevOps Engineer specializing in Kubernetes orchestration, infrastructure automation, non-root application security, and self-hosted cloud platforms.</p>
+        <p>This site is deployed automatically via container builds pushed to GitHub Container Registry, tracked by GitOps controllers, and served via non-root Nginx on Kubernetes.</p>
+        <div class="about-stack">
+          <span class="stack-badge">Kubernetes</span>
+          <span class="stack-badge">ArgoCD</span>
+          <span class="stack-badge">Nginx Unprivileged</span>
+          <span class="stack-badge">GitHub Actions</span>
+          <span class="stack-badge">Cloudflare Tunnels</span>
         </div>
-        <h2>Hardening Unprivileged Nginx in Kubernetes</h2>
-        <p>Running non-root Nginx containers with strict security contexts, custom port bindings (8080), and read-only root filesystems.</p>
-        <div class="card-tags">
-          <span class="tag">#homelab</span>
-          <span class="tag">#kubernetes</span>
-        </div>
-      </article>
+      </div>
     </section>
   </main>
+
+  <!-- Modal for full post view -->
+  <div id="postModal" class="modal-backdrop">
+    <div class="modal-content">
+      <button class="modal-close" id="modalCloseBtn">&times;</button>
+      <div class="card-meta">
+        <span class="date" id="modalDate"></span>
+        <span class="read-time" id="modalReadTime"></span>
+      </div>
+      <h1 id="modalTitle"></h1>
+      <div class="card-tags" id="modalTags" style="margin-bottom: 1.5rem;"></div>
+      <div id="modalBody" class="modal-body-text"></div>
+    </div>
+  </div>
 
   <footer>
     <div class="container footer-content">
