@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>G-SPACE // DevOps & Infrastructure Notes</title>
+  <title>DevOps & Infrastructure Notes</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -42,7 +42,33 @@
       </div>
     </section>
 
-    <section id="posts" class="posts-grid"></section>
+    <section id="posts" class="posts-grid">
+      <article class="post-card" data-post-id="renovate-argocd" data-tags="kubernetes gitops">
+        <div class="card-meta">
+          <span class="date">2026-08-25</span>
+          <span class="read-time">5 min read</span>
+        </div>
+        <h2>Automating Image Updates with Renovate and ArgoCD</h2>
+        <p>A look into pushing static build artifacts to container registries and triggering seamless GitOps deployments via Renovate pull requests.</p>
+        <div class="card-tags">
+          <span class="tag">#kubernetes</span>
+          <span class="tag">#gitops</span>
+        </div>
+      </article>
+
+      <article class="post-card" data-post-id="nginx-hardening" data-tags="homelab kubernetes">
+        <div class="card-meta">
+          <span class="date">2026-08-18</span>
+          <span class="read-time">8 min read</span>
+        </div>
+        <h2>Hardening Unprivileged Nginx in Kubernetes</h2>
+        <p>Running non-root Nginx containers with strict security contexts, custom port bindings (8080), and read-only root filesystems.</p>
+        <div class="card-tags">
+          <span class="tag">#homelab</span>
+          <span class="tag">#kubernetes</span>
+        </div>
+      </article>
+    </section>
 
     <section id="about" class="about-section">
       <div class="about-card">
@@ -52,6 +78,7 @@
         <div class="about-stack">
           <span class="stack-badge">Kubernetes</span>
           <span class="stack-badge">ArgoCD</span>
+          <span class="stack-badge">Renovate</span>
           <span class="stack-badge">Nginx Unprivileged</span>
           <span class="stack-badge">GitHub Actions</span>
           <span class="stack-badge">Cloudflare Tunnels</span>
@@ -60,7 +87,7 @@
     </section>
   </main>
 
-  <!-- Modal for full post view -->
+  <!-- Full Article Modal -->
   <div id="postModal" class="modal-backdrop">
     <div class="modal-content">
       <button class="modal-close" id="modalCloseBtn">&times;</button>

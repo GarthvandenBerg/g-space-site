@@ -29,6 +29,7 @@ body {
   padding: 0 1.5rem;
 }
 
+/* Navigation */
 .navbar {
   border-bottom: 1px solid var(--border);
   padding: 1.25rem 0;
@@ -43,6 +44,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  position: relative;
 }
 
 .logo {
@@ -57,6 +59,11 @@ body {
   color: var(--accent);
 }
 
+nav {
+  display: flex;
+  align-items: center;
+}
+
 nav a {
   color: var(--text-muted);
   text-decoration: none;
@@ -69,6 +76,7 @@ nav a:hover {
   color: var(--accent);
 }
 
+/* Mobile Hamburger Toggle Button */
 .hamburger {
   display: none;
   flex-direction: column;
@@ -76,6 +84,7 @@ nav a:hover {
   background: transparent;
   border: none;
   cursor: pointer;
+  padding: 0;
 }
 
 .hamburger span {
@@ -83,8 +92,10 @@ nav a:hover {
   height: 2px;
   background-color: var(--text);
   transition: all 0.3s;
+  display: block;
 }
 
+/* Hero Section */
 .hero {
   padding: 4rem 0 2rem;
 }
@@ -117,6 +128,7 @@ nav a:hover {
   font-size: 1.1rem;
 }
 
+/* Controls & Filtering */
 .controls {
   margin: 2rem 0;
   display: flex;
@@ -164,6 +176,7 @@ nav a:hover {
   border-color: var(--accent);
 }
 
+/* Articles */
 .posts-grid {
   display: flex;
   flex-direction: column;
@@ -209,6 +222,7 @@ nav a:hover {
 .card-tags {
   display: flex;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .tag {
@@ -217,6 +231,7 @@ nav a:hover {
   color: var(--accent);
 }
 
+/* About Section & Badges */
 .about-section {
   margin: 4rem 0;
   border-top: 1px solid var(--border);
@@ -252,12 +267,13 @@ nav a:hover {
   font-size: 0.8rem;
   background: var(--bg);
   border: 1px solid var(--border);
-  padding: 0.3rem 0.6rem;
+  padding: 0.35rem 0.75rem;
   border-radius: 4px;
-  color: var(--text);
+  color: var(--accent);
+  display: inline-block;
 }
 
-/* Modal Styling */
+/* Article Modal */
 .modal-backdrop {
   position: fixed;
   top: 0;
@@ -318,7 +334,7 @@ nav a:hover {
   color: var(--accent);
 }
 
-/* Mobile Responsive Adjustments */
+/* Responsive Mobile Navigation */
 @media (max-width: 768px) {
   .hamburger {
     display: flex;
