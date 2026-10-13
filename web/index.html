@@ -34,41 +34,13 @@
 
     <section class="controls">
       <input type="text" id="searchInput" placeholder="Search posts or tags (e.g., #kubernetes, #gitops)..." autocomplete="off">
-      <div class="tags" id="tagFilters">
-        <button class="tag-btn active" data-tag="all">All</button>
-        <button class="tag-btn" data-tag="kubernetes">Kubernetes</button>
-        <button class="tag-btn" data-tag="gitops">GitOps</button>
-        <button class="tag-btn" data-tag="homelab">Homelab</button>
-      </div>
+      <div class="tags" id="tagFilters"></div>
     </section>
 
-    <section id="posts" class="posts-grid">
-      <article class="post-card" data-post-id="renovate-argocd" data-tags="kubernetes gitops">
-        <div class="card-meta">
-          <span class="date">2026-08-25</span>
-          <span class="read-time">5 min read</span>
-        </div>
-        <h2>Automating Image Updates with Renovate and ArgoCD</h2>
-        <p>A look into pushing static build artifacts to container registries and triggering seamless GitOps deployments via Renovate pull requests.</p>
-        <div class="card-tags">
-          <span class="tag">#kubernetes</span>
-          <span class="tag">#gitops</span>
-        </div>
-      </article>
-
-      <article class="post-card" data-post-id="nginx-hardening" data-tags="homelab kubernetes">
-        <div class="card-meta">
-          <span class="date">2026-08-18</span>
-          <span class="read-time">8 min read</span>
-        </div>
-        <h2>Hardening Unprivileged Nginx in Kubernetes</h2>
-        <p>Running non-root Nginx containers with strict security contexts, custom port bindings (8080), and read-only root filesystems.</p>
-        <div class="card-tags">
-          <span class="tag">#homelab</span>
-          <span class="tag">#kubernetes</span>
-        </div>
-      </article>
+    <section id="posts" class="posts-grid" aria-live="polite">
+      <p class="status-msg" id="loadingMsg">Loading posts…</p>
     </section>
+    <p class="status-msg" id="emptyState" hidden>No posts match your search. Try a different word or tag.</p>
 
     <section id="about" class="about-section">
       <div class="about-card">
@@ -88,9 +60,9 @@
   </main>
 
   <!-- Full Article Modal -->
-  <div id="postModal" class="modal-backdrop">
+  <div id="postModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="modal-content">
-      <button class="modal-close" id="modalCloseBtn">&times;</button>
+      <button class="modal-close" id="modalCloseBtn" aria-label="Close article">&times;</button>
       <div class="card-meta">
         <span class="date" id="modalDate"></span>
         <span class="read-time" id="modalReadTime"></span>
@@ -106,9 +78,6 @@
       <p>&copy; 2026 g-space.co.za &mdash; Served via Nginx unprivileged container.</p>
     </div>
   </footer>
-
-  <a href="mailto:example@example.com">Send Email</a>
-
   <script src="script.js"></script>
 </body>
 </html>

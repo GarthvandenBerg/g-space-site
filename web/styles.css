@@ -368,3 +368,73 @@ footer {
   color: var(--text-muted);
   font-size: 0.875rem;
 }
+/* ---------- Additions for data-driven posts ---------- */
+
+.status-msg {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  margin-bottom: 2rem;
+}
+
+.post-card:focus-visible,
+.tag-btn:focus-visible,
+.modal-close:focus-visible,
+.hamburger:focus-visible,
+#searchInput:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Rich article body (rendered from Markdown) */
+.modal-body-text h2,
+.modal-body-text h3,
+.modal-body-text h4 {
+  color: #fff;
+  margin: 2rem 0 0.75rem;
+  line-height: 1.3;
+}
+.modal-body-text h2 { font-size: 1.4rem; }
+.modal-body-text h3 { font-size: 1.15rem; }
+.modal-body-text h4 { font-size: 1rem; }
+
+.modal-body-text ul,
+.modal-body-text ol {
+  margin: 0 0 1.25rem 1.5rem;
+  line-height: 1.7;
+}
+.modal-body-text li { margin-bottom: 0.35rem; }
+
+.modal-body-text a {
+  color: var(--accent);
+  text-underline-offset: 3px;
+}
+
+.modal-body-text blockquote {
+  border-left: 3px solid var(--accent);
+  padding: 0.25rem 0 0.25rem 1rem;
+  margin: 0 0 1.25rem;
+  color: var(--text-muted);
+}
+
+.modal-body-text pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin: 0 0 1.25rem;
+  overflow-x: auto;
+}
+.modal-body-text pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+body.modal-open { overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  .post-card { transition: border-color 0.2s; }
+  .post-card:hover { transform: none; }
+}
