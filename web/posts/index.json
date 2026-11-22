@@ -1,4 +1,14 @@
 [
+  "homelab-architecture-overview",
+  "why-talos-linux",
+  "gitops-argocd-sync-waves",
+  "disaster-recovery-homelab",
+  "secrets-management-openbao-eso",
+  "storage-strategy-cnpg-longhorn",
+  "networking-cilium-cloudflare-netbird",
+  "observability-prometheus-grafana-coroot",
+  "terraform-bootstrap-two-layer-approach",
+  "lessons-learned-homelab",
   "nginx-hardening",
   "renovate-argocd"
 ]
