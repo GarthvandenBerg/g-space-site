@@ -1,24 +1,24 @@
 ---
-title: Homelab Networking in Three Layers: Cilium, Cloudflare Tunnel, and NetBird
+title: "Homelab Networking in Three Layers: Cilium, Cloudflare Tunnel, and NetBird"
 date: 2026-11-22
 readTime: 9
 tags: homelab, kubernetes, networking, infrastructure
-summary: How I built a zero-inbound-port homelab network using Cilium eBPF as the CNI, Cloudflare Tunnel for public exposure, and NetBird WireGuard mesh for private access — with Caddy HA and Technitium DNS rounding it out.
+summary: How I built a zero-inbound-port homelab network using Cilium eBPF as the CNI, Cloudflare Tunnel for public exposure, and a NetBird WireGuard mesh for private access, with Caddy HA and Technitium DNS rounding it out.
 ---
 
-**TL;DR:** My homelab Kubernetes cluster (5 Talos Linux nodes on Proxmox) exposes services through two entirely separate paths: public websites go through a Cloudflare Tunnel managed by the `cfgate` operator, while private apps like Immich are reached via a NetBird WireGuard mesh and a pair of Caddy reverse proxies running in Proxmox LXC containers with keepalived HA. The underlying CNI is **Cilium in kube-proxy replacement mode**, handling load balancing entirely in eBPF. No inbound ports are open on the home router.
+**TL;DR:** My homelab Kubernetes cluster (five **Talos Linux** nodes on **Proxmox**) exposes services through two entirely separate paths. **Public websites** go through a **Cloudflare Tunnel** managed by the `cfgate` operator. **Private apps** such as Immich are reached over a **NetBird WireGuard mesh** and a pair of **Caddy** reverse proxies running in Proxmox LXC containers with **keepalived** HA. The CNI is **Cilium in kube-proxy replacement mode**, doing load balancing in eBPF. **No inbound ports are open on the home router.**
+
+*Note: IP addresses in this post are generalized (`192.168.<lan>.x`) rather than copied from my real network.*
 
 ## The Design Goal: Zero Inbound Ports
 
-The single constraint that shaped every networking decision: **the home router exposes no inbound ports**. No port-forwarding, no dynamic DNS pointing at a home IP, no exposed SSH. This rules out the obvious approaches — you can't just slap a NodePort on something and call it a day.
+One constraint shaped every decision: **the home router exposes no inbound ports.** No port-forwarding, no dynamic DNS pointing at a home IP, no exposed SSH. That rules out the obvious shortcut of putting a NodePort on a service and forwarding it.
 
-The solution falls into three distinct layers:
+The design has three layers:
 
-1. **CNI layer** — Cilium provides in-cluster load balancing and Gateway API support.
-2. **Public exposure** — Cloudflare Tunnel (`cfgate` operator) punches outbound-only connections to Cloudflare's edge.
-3. **Private access** — NetBird WireGuard mesh lets trusted users reach internal apps without exposing anything publicly.
-
-Each layer has a clear responsibility. Let me walk through each one.
+1. **CNI layer:** Cilium provides in-cluster load balancing, Gateway API support, and LoadBalancer IPs.
+2. **Public exposure:** Cloudflare Tunnel (via the `cfgate` operator) makes **outbound-only** connections to Cloudflare's edge.
+3. **Private access:** a NetBird WireGuard mesh lets trusted users reach internal apps without exposing anything publicly.
 
 ---
 
@@ -26,30 +26,28 @@ Each layer has a clear responsibility. Let me walk through each one.
 
 ### Why Cilium
 
-Cilium's **eBPF dataplane** replaces both `iptables` and `kube-proxy` entirely. This is the right choice for Talos Linux, which is a minimal, immutable OS — the less userspace networking plumbing to maintain, the better. Cilium also ships native **Gateway API** support and **L2 announcements** for `LoadBalancer`-type services, which eliminates the need for a separate MetalLB installation.
+Cilium's **eBPF dataplane** replaces `kube-proxy` and most `iptables`-based service routing. That suits Talos Linux, a minimal immutable OS, because there is less userspace networking plumbing to maintain. Cilium also provides native **Gateway API** support and **L2 announcements** for `LoadBalancer` services, which removes the need for a separate MetalLB install.
 
 ### Talos Prerequisites
 
-Talos has to be told to get out of the way before Cilium can own the dataplane. Two patches are required:
+Talos must be told not to install its own CNI or kube-proxy before Cilium can own the dataplane:
 
 ```yaml
 # shared-patch.yaml (excerpt)
 cluster:
   network:
     cni:
-      name: none        # disable built-in CNI
+      name: none        # do not install a built-in CNI
   proxy:
-    disabled: true      # disable kube-proxy
+    disabled: true      # do not run kube-proxy
 ```
-
-With `CNI=none`, Talos does not install a CNI plugin. With `kube-proxy disabled`, the in-tree proxy never starts. Cilium fills both gaps.
 
 ### Key Cilium Configuration
 
 ```yaml
 kubeProxyReplacement: true
 k8sServiceHost: localhost
-k8sServicePort: 7445          # Talos local API port
+k8sServicePort: 7445          # KubePrism local API endpoint
 gatewayAPI:
   enabled: true
 l2announcements:
@@ -58,23 +56,19 @@ bpf:
   masquerade: true
 ```
 
-`k8sServiceHost: localhost` / `k8sServicePort: 7445` is the Talos-specific wiring — Cilium talks to the local Talos API server rather than the external control-plane VIP.
+`localhost:7445` is **KubePrism**, Talos's built-in local load balancer for the **Kubernetes API**. Pointing Cilium at it means the agent can reach the API server on every node without depending on the external control-plane VIP, which matters during bootstrap and node restarts.
 
 ### LoadBalancer IP Pool and L2 Announcements
 
-A `CiliumLoadBalancerIPPool` carves out `192.168.2.200–192.168.2.240` for `LoadBalancer`-type services. An `L2AnnouncementPolicy` on `eth0` advertises those IPs at Layer 2 so the home router's ARP table picks them up — no BGP required.
+A `CiliumLoadBalancerIPPool` reserves a block of addresses at the top of the LAN subnet (`192.168.<lan>.200–240`) for `LoadBalancer` services. A `CiliumL2AnnouncementPolicy` advertises those IPs via ARP on the node's primary interface, so the home router and other LAN clients can reach them. **No BGP is required.**
 
-Some assigned IPs worth noting:
-- ArgoCD: `192.168.2.206`
-- Grafana: `192.168.2.230`
-- Prometheus: `192.168.2.231`
-- Local gateway: `192.168.2.240`
+Internal services such as ArgoCD, Grafana, and Prometheus each get a stable IP from this pool.
 
 ### Bootstrap Order and the 300-Second Problem
 
-Cilium is bootstrapped by **Terraform (Helm) before ArgoCD**, because ArgoCD itself needs a working pod network to run. This creates a subtle ordering problem: Cilium's Custom Resource Definitions (CRDs — `CiliumLoadBalancerIPPool`, `L2AnnouncementPolicy`, etc.) are not reliably registered by the time Terraform tries to apply them.
+Cilium is installed by **Terraform (Helm) before ArgoCD**, because ArgoCD needs a working pod network. This creates an ordering problem: Cilium's CRDs (`CiliumLoadBalancerIPPool`, `CiliumL2AnnouncementPolicy`, and others) are not reliably registered when Terraform tries to apply resources that use them.
 
-The fix is unglamorous but honest:
+The fix is unglamorous:
 
 ```hcl
 resource "time_sleep" "wait_for_cilium_crds" {
@@ -83,11 +77,11 @@ resource "time_sleep" "wait_for_cilium_crds" {
 }
 ```
 
-A 300-second `time_sleep` after the Helm install. It works. A proper solution would poll for CRD readiness, but a fixed wait is predictable and simple, and the total bootstrap time is dominated by other steps anyway.
+A fixed **300-second** wait after the Helm install. A proper solution would poll for CRD readiness, but a fixed delay is predictable and simple, and total bootstrap time is dominated by other steps anyway.
 
 ### Limitations
 
-Hubble (Cilium's flow visibility and observability layer) is enabled but not yet used for flow analysis or policy generation. More importantly: **no `NetworkPolicy` or `CiliumNetworkPolicy` resources have been written yet**. The pod network is flat — any pod can reach any other pod. This is a known gap and a planned next step.
+**Hubble** (Cilium's flow-visibility layer) is enabled but not yet used for flow analysis or policy generation. More importantly, **no `NetworkPolicy` or `CiliumNetworkPolicy` resources exist yet.** The pod network is flat, so any pod can reach any other pod. This is a known gap and the next planned security step.
 
 ---
 
@@ -95,32 +89,28 @@ Hubble (Cilium's flow visibility and observability layer) is enabled but not yet
 
 ### Why Cloudflare Tunnel
 
-Cloudflare Tunnel (`cloudflared`) opens an outbound-only persistent connection from inside the cluster to Cloudflare's global network. Requests arrive at Cloudflare's edge, travel through the tunnel, and hit your service — with no inbound port on your router and no exposed home IP. It's the cleanest solution to the zero-inbound-port constraint for public traffic.
+`cloudflared` opens a persistent **outbound-only** connection from the cluster to Cloudflare's network. Requests hit Cloudflare's edge, travel through the tunnel, and reach the service. There is no inbound router port and no exposed home IP, which makes it a clean fit for the zero-inbound-port constraint.
 
 ### How cfgate Works
 
-The **`cfgate.io` operator** extends the standard Kubernetes Gateway API with Cloudflare-specific resources:
+The **`cfgate.io` operator** extends the Kubernetes **Gateway API** with Cloudflare-specific resources:
 
-- `CloudflareTunnel` — provisions the tunnel itself
-- `GatewayClass` / `Gateway` — the cfgate-managed gateway that HTTPRoutes attach to
-- `CloudflareDNS` — automatically syncs DNS records for every route attached to the gateway
+- `CloudflareTunnel`: provisions the tunnel
+- `GatewayClass` / `Gateway`: the cfgate-managed gateway that `HTTPRoute`s attach to
+- `CloudflareDNS`: syncs DNS records for the routes attached to the gateway
 
-`cloudflared` runs as a `Deployment` with **2 replicas** inside the cluster, so the tunnel itself is redundant. HTTPRoutes attach to the cfgate `Gateway` exactly as they would to any other Gateway API implementation.
-
-The `CloudflareDNS` resource deserves a mention: it reads the hostnames from the attached `Gateway` routes and creates or updates the corresponding DNS records in Cloudflare automatically. No manual DNS management.
+`cloudflared` runs as a **Deployment with 2 replicas**, so the tunnel connector is redundant. `HTTPRoute`s attach to the cfgate `Gateway` exactly as they would to any other Gateway API implementation, and `CloudflareDNS` creates or updates the matching DNS records automatically.
 
 ### What Goes Through the Tunnel
 
-Only **public-facing websites** — including this blog — use the Cloudflare Tunnel path. Apps like Immich and ArgoCD are intentionally *not* exposed publicly. Immich handles personal photos; ArgoCD has cluster-admin access. Neither should be on the public internet.
+Only **public-facing websites**, including this blog. Apps like Immich and ArgoCD are intentionally **not** exposed publicly: Immich holds personal photos and ArgoCD has cluster-admin reach.
 
-Renovate manages the `cloudflare/cloudflared` container image version via an inline annotation:
+**Renovate** tracks the `cloudflare/cloudflared` image version through an inline annotation, so image updates arrive as reviewable pull requests:
 
 ```yaml
 # renovate: datasource=docker depName=cloudflare/cloudflared
-image: cloudflare/cloudflared:2025.x.x
+image: cloudflare/cloudflared:<pinned-version>
 ```
-
-PR-based image updates mean the tunnel image never drifts without a review.
 
 ---
 
@@ -128,46 +118,43 @@ PR-based image updates mean the tunnel image never drifts without a review.
 
 ### NetBird: WireGuard Mesh VPN
 
-**NetBird** is a managed WireGuard mesh VPN. Friends and family install the NetBird client, and they get access to private apps (Immich, primarily) without any of them needing to know what a VPN config file looks like. Exit nodes on the NetBird mesh also expose the home LAN and VLANs (management, Proxmox, TrueNAS) for my own remote access.
+**NetBird** is a managed **WireGuard** mesh VPN. Friends and family install the client and get access to private apps (mainly Immich) without handling VPN config files. NetBird exit nodes also expose the home LAN and VLANs (management, Proxmox, TrueNAS) for my own remote administration.
 
-This replaced the previous **KubeSpan** setup, which was a WireGuard overlay that stretched across a cloud control-plane node and the home nodes. When all nodes moved fully on-premises, KubeSpan was removed — NetBird now handles private connectivity entirely outside the cluster.
+NetBird replaced the earlier **KubeSpan** setup, a WireGuard overlay that stretched across a cloud control-plane node and the home nodes. Once all nodes moved on-premises, KubeSpan was removed and NetBird took over private connectivity **outside the cluster**.
 
 ### Caddy: Reverse Proxy in Proxmox LXC
 
-Caddy runs in **Alpine LXC containers on Proxmox** — deliberately *outside* Kubernetes. Kubernetes networking is not stable during cluster rebuilds; a reverse proxy that depends on the cluster would be unavailable exactly when you might need it most. LXC containers on Proxmox are simpler, lighter, and outlast cluster rebuilds.
+Caddy runs in **Alpine LXC containers on Proxmox**, deliberately *outside* Kubernetes. Cluster networking is unstable during rebuilds, and a proxy that depends on the cluster would disappear exactly when it is most useful. LXC containers are lighter and outlast cluster rebuilds.
 
-A custom Docker image packages Caddy with the Cloudflare DNS plugin baked in. The image is built, exported, and uploaded to Proxmox as an **LXC template**, so new containers are consistent and reproducible.
+A custom Docker image packages Caddy with the **Cloudflare DNS plugin**. The image is exported and uploaded to Proxmox as an **LXC template**, so new containers are consistent and reproducible.
 
-TLS certificates are issued via **Cloudflare DNS-01 challenge** — Caddy calls the Cloudflare API to prove domain ownership, which works even for internal hostnames that are never publicly reachable. The Cloudflare API token lives in an `envfile` on the LXC host, `chmod 600`.
+TLS certificates are issued with the **Cloudflare DNS-01 challenge**: Caddy uses the Cloudflare API to prove domain ownership, which works for internal hostnames that are never publicly reachable. The API token is stored in an `envfile` on the LXC host with `chmod 600`.
 
 ### High Availability: keepalived VRRP
 
-Two Caddy LXC containers run in parallel with **keepalived** providing a VRRP virtual IP:
+Two Caddy containers run in parallel with **keepalived** providing a **VRRP** virtual IP:
 
-- VIP: `192.168.70.244/24`
-- Primary: priority `101` (active)
-- Secondary: priority `100` (standby)
-- Health check: `pidof caddy` — if the Caddy process disappears, keepalived fails over
+- **Virtual IP:** one address on the private services subnet
+- **Primary:** priority `101` (active)
+- **Secondary:** priority `100` (standby)
+- **Health check:** `pidof caddy`; if the Caddy process disappears, keepalived fails over
 
-This means a single LXC container going down (for maintenance, Proxmox host reboot, or failure) does not take private access offline. The failover is transparent to NetBird clients.
+A single LXC container going down (maintenance, host reboot, or failure) does not take private access offline, and failover is transparent to NetBird clients.
 
 ### Internal DNS: Technitium
 
-A **Technitium DNS cluster** handles internal name resolution. Internal hostnames (the ones Caddy terminates) resolve to `192.168.70.244` (the Caddy VIP). External hostnames resolve normally via Cloudflare.
+A **Technitium DNS cluster** handles internal name resolution. Internal hostnames that Caddy terminates resolve to the Caddy VIP; external hostnames resolve normally via Cloudflare.
 
-Uptime Kuma on the QDevice monitors the full user path — DNS → Caddy → Immich — and fires Discord alerts if any segment breaks.
+**Uptime Kuma** (running on the QDevice) monitors the full user path (DNS → Caddy → Immich) and sends Discord alerts if any segment breaks.
 
 ---
 
 ## Trade-offs and Lessons
 
-**Caddy outside Kubernetes was the right call.** It adds a small operational boundary to manage (LXC containers vs. a Deployment), but the resilience benefit during cluster rebuilds is real. During a timed rebuild drill in November 2026, private access via Caddy/NetBird remained up for the entire ~33 minutes the cluster was down.
-
-**The 300-second sleep is a known smell.** It works, but a proper solution polls for CRD readiness. It's on the list.
-
-**No NetworkPolicy yet.** This is the most significant security gap. With Hubble enabled, the next step is to use flow data to generate a least-privilege policy baseline. Flat pod networks are fine in a homelab during active development; they're not acceptable long-term.
-
-**cfgate simplifies a lot.** Managing a Cloudflare Tunnel manually involves syncing config files and DNS records. The cfgate operator reduces it to `HTTPRoute` resources and a `CloudflareDNS` object — a clean GitOps-friendly interface.
+- **Caddy outside Kubernetes was the right call.** It adds an operational boundary (LXC containers instead of a Deployment), but the proxy and NetBird layers stayed up during the November 2026 rebuild drill (~33 minutes). *Backends running inside the cluster, such as Immich, were unavailable until the rebuild finished*, but the access layer never needed to be rebuilt.
+- **The 300-second sleep is a known smell.** It works, but polling for CRD readiness is the proper fix.
+- **No NetworkPolicy yet.** This is the most significant security gap. The plan is to use Hubble flow data to generate a least-privilege baseline.
+- **cfgate simplifies a lot.** Managing a tunnel manually means syncing config files and DNS records. With cfgate it reduces to `HTTPRoute` resources plus a `CloudflareDNS` object, a GitOps-friendly interface.
 
 ---
 
@@ -175,9 +162,9 @@ Uptime Kuma on the QDevice monitors the full user path — DNS → Caddy → Imm
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| CNI | Cilium (eBPF, kube-proxy replacement) | In-cluster L4 LB, Gateway API, L2 IPs |
+| CNI | Cilium (eBPF, kube-proxy replacement) | In-cluster L4 load balancing, Gateway API, L2 IPs |
 | Public | Cloudflare Tunnel + cfgate operator | Zero-inbound-port public websites |
-| Private | NetBird WireGuard + Caddy HA LXC | Friends/family and self remote access |
+| Private | NetBird WireGuard + Caddy HA (LXC) | Friends/family and my own remote access |
 | DNS | Technitium (internal) + Cloudflare (external) | Name resolution across both paths |
 
-The overall design keeps the blast radius of any single component failure small: the cluster can be rebuilt without touching NetBird or Caddy; Cloudflare Tunnel is stateless and recovers with the cluster; and the two-replica Caddy HA setup means LXC maintenance doesn't interrupt private access. It's not a production network, but the patterns are ones I'd carry into a professional infrastructure role without hesitation.
+The design keeps the **blast radius** of any single component small: the cluster can be rebuilt without touching NetBird or Caddy, Cloudflare Tunnel is stateless and recovers with the cluster, and the two-node Caddy HA pair means LXC maintenance does not interrupt private access. It is not a production network, but these are patterns I would carry into a professional infrastructure role.
