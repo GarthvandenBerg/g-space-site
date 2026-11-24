@@ -1,28 +1,26 @@
 ---
 title: Hardening Unprivileged Nginx in Kubernetes
 date: 2026-08-18
-readTime: 8
-tags: homelab, kubernetes
-summary: Running non-root Nginx containers with strict security contexts, custom port bindings (8080), and read-only root filesystems.
+readTime: 7
+tags: homelab, kubernetes, nginx
+summary: Running non-root Nginx containers without tearing your hair out over port bindings, scratch folders, and crash loops.
 ---
 
-Standard Nginx containers default to binding on privileged port 80 and execution under root UID 0. In hardened Kubernetes setups, strict security policies block root containers outright — and for good reason. This post walks through how to run Nginx properly in a security-conscious cluster: unprivileged base image, tight `securityContext` fields, `emptyDir` scratch volumes, and a ConfigMap-driven config pattern.
+If you drop a standard Nginx container into a locked-down Kubernetes cluster, it falls flat on its face right away. It wants port 80, it wants to write to paths it has no business touching as a regular user, and it will just crash loop until you sort it out.
 
-## Why Unprivileged Containers Matter
+Standard Nginx assumes it has root UID 0, so it can bind to low ports and write wherever it feels like. That might be fine for a quick test on your laptop, but once you start turning on proper security in your cluster, Kubernetes will kick it straight out the door. 
 
-Kubernetes introduced [Pod Security Standards (PSS)](https://kubernetes.io/docs/concepts/security/pod-security-standards/) as the successor to PodSecurityPolicy. PSS defines three policy levels:
+Here is how I set up non-root Nginx properly with unprivileged images, tight security contexts, scratch mounts, and ConfigMaps so it actually behaves.
 
-- **Privileged** — no restrictions, essentially the legacy default.
-- **Baseline** — prevents the most obvious privilege escalations (host namespaces, privileged containers, etc.).
-- **Restricted** — the strictest tier: requires non-root users, disallows privilege escalation, mandates read-only root filesystems, and drops all Linux capabilities.
+## Why bother running unprivileged?
 
-If your namespace is labelled `pod-security.kubernetes.io/enforce: restricted`, any workload that doesn't satisfy the restricted policy is rejected at admission time — no warnings, just a hard `403`. That means you can't ship the stock `nginx:latest` image without modification.
+Kubernetes has Pod Security Standards, and if you label your namespace with restricted security, the cluster stops playing around. The admission webhook checks incoming pods, and if something tries to run as root or asks for privilege escalation, it throws a hard 403 error. No polite warnings, it just rejects the pod.
 
-Beyond PSS, running as root inside a container is a defence-in-depth failure point. If a vulnerability in Nginx (or in a served application) allows a container breakout, a root UID makes host compromise substantially easier, especially on nodes where the container runtime runs with elevated privileges.
+Even if you aren't enforcing restricted policies yet, running containers as root is just asking for trouble. If somebody finds an exploit in Nginx or an application sitting behind it and breaks out of the container, you really do not want them landing on your node as root. Running as a plain user gives you a real safety net if something goes sideways.
 
-## What Breaks With Standard Nginx
+## What happens when stock Nginx breaks
 
-Try deploying `nginx:latest` under a restricted namespace with a minimal `securityContext`:
+To see what goes wrong, take the standard `nginx:latest` image and give it a basic non-root security context:
 
 ```yaml
 securityContext:
@@ -30,32 +28,34 @@ securityContext:
   allowPrivilegeEscalation: false
 ```
 
-The pod will be admitted but it will immediately crash. Nginx's master process attempts to:
+Kubernetes lets the pod in, but it dies immediately. When you check the logs, you get slapped with:
 
-1. Bind to port **80** — a privileged port, requiring `CAP_NET_BIND_SERVICE` or UID 0.
-2. Write PID files and cache data to `/var/run` and `/var/cache/nginx` — paths owned by root with restrictive permissions.
-3. Fork worker processes that inherit the root UID.
+```text
+nginx: [emerg] bind() to 0.0.0.0:80 failed (13: Permission denied)
+```
 
-The result is a `CrashLoopBackOff` with errors like `nginx: [emerg] bind() to 0.0.0.0:80 failed (13: Permission denied)` in the logs. Even if you patch the port, the filesystem writes fail under a read-only root.
+By default in Linux, any port below 1024 is privileged. A regular user cannot touch it unless you grant extra capabilities like `CAP_NET_BIND_SERVICE`. On top of the port issue, Nginx immediately tries to write its PID file to `/var/run/` and cache files to `/var/cache/nginx`. Since those folders are owned by root, the whole thing grinds to a halt.
 
-## The `nginx-unprivileged` Base Image
+## The unprivileged base image
 
-NGINX Inc. maintains [`nginxinc/nginx-unprivileged`](https://hub.docker.com/r/nginxinc/nginx-unprivileged) specifically for this scenario. Key differences from the standard image:
+Instead of fighting the stock image and trying to hack permissions by hand, the easiest starting point is `nginxinc/nginx-unprivileged`. 
 
-- Runs as **UID 101** (`nginx` system user) rather than root.
-- Listens on **port 8080** by default.
-- Ships with pre-adjusted directory permissions so the `nginx` user can write to `/var/cache/nginx` and `/var/run` at startup.
+It comes pre-configured with a few sanity checks:
 
-That last point is relevant — but as we'll see, a read-only root filesystem re-introduces the write problem, so we still need to handle scratch paths explicitly.
+- It runs as UID 101 (the `nginx` user) instead of root.
+- It listens on port 8080 out of the box so you don't fight low-port binding rules.
+- Directory permissions for `/var/cache/nginx` and `/var/run` are already set up for UID 101.
 
-## The Full `securityContext`
+This gets you past the first round of errors, but if you want to lock the container down with a read-only root filesystem, you run straight into the next hurdle.
 
-For a restricted-compliant deployment, the container-level `securityContext` looks like this:
+## Locking down the security context
+
+Here is the container-level `securityContext` I use for locked-down deployments:
 
 ```yaml
 securityContext:
   runAsNonRoot: true
-  runAsUser: 101          # nginx-unprivileged UID
+  runAsUser: 101
   runAsGroup: 101
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
@@ -64,25 +64,23 @@ securityContext:
       - ALL
 ```
 
-Field by field:
+What this is doing:
 
-| Field | Why it matters |
-|---|---|
-| `runAsNonRoot: true` | Admission webhook rejects the pod if the image would run as UID 0. |
-| `runAsUser: 101` | Pins the UID explicitly; don't rely on the image default alone. |
-| `allowPrivilegeEscalation: false` | Prevents `setuid`/`setgid` binaries inside the container from gaining new privileges. Sets the `no_new_privs` seccomp bit. |
-| `readOnlyRootFilesystem: true` | Mounts the container's root filesystem as read-only. Any write to an un-mounted path fails immediately — a strong containment boundary. |
-| `capabilities.drop: [ALL]` | Strips every Linux capability. Nginx doesn't need any to serve traffic on 8080 as a non-root user. |
+`runAsNonRoot: true` tells Kubernetes to reject the pod if the container image tries to run as UID 0.
 
-## Handling Write Paths With `emptyDir`
+`runAsUser: 101` and `runAsGroup: 101` pin the UID and GID explicitly so there is no guessing what user the process runs as.
 
-Even with `nginx-unprivileged`, Nginx still needs to write to a few paths at runtime:
+`allowPrivilegeEscalation: false` sets the `no_new_privs` flag in the Linux kernel so processes inside cannot grab higher privileges through setuid binaries.
 
-- `/tmp` — temporary files during request processing.
-- `/var/cache/nginx` — proxy and fastcgi cache buffers.
-- `/var/run` — the PID file (`nginx.pid`).
+`readOnlyRootFilesystem: true` mounts the root filesystem as read-only. Nothing inside the container can write to disk unless you explicitly give it a scratch volume.
 
-With `readOnlyRootFilesystem: true` these writes fail silently or loudly depending on the Nginx version. The fix is to mount ephemeral `emptyDir` volumes over each writable path:
+`capabilities.drop: [ALL]` strips away every single Linux capability. Nginx serving on port 8080 as a regular user does not need any of them.
+
+## Giving Nginx its write paths with emptyDir
+
+Once you turn on `readOnlyRootFilesystem: true`, Nginx blows up again. Even in the unprivileged image, Nginx still needs to write temporary request buffers, proxy cache files, and its PID file at runtime. If the root filesystem is read-only, those writes fail and Nginx refuses to start.
+
+The fix is mounting ephemeral `emptyDir` volumes over the exact paths Nginx needs to touch:
 
 ```yaml
 volumes:
@@ -105,11 +103,13 @@ containers:
         mountPath: /var/run
 ```
 
-`emptyDir` volumes live on the node's local disk (or memory if `medium: Memory` is set), are scoped to the pod's lifetime, and are writable by the container UID. They satisfy Nginx's runtime write requirements without punching holes in the read-only filesystem guarantee.
+An `emptyDir` volume lives on the node's local disk, dies when the pod dies, and is owned by the container user. This gives Nginx the sandbox space it needs to do its job without opening up the rest of the container filesystem to writes.
 
-## ConfigMap-Driven Nginx Configuration
+## Managing config with ConfigMaps
 
-Because the root filesystem is read-only, you can't `kubectl exec` into the pod and edit `/etc/nginx/nginx.conf` in place. That's actually a feature — it forces configuration to be declarative. The idiomatic pattern is a ConfigMap mounted over `/etc/nginx/conf.d/`:
+Because the root filesystem is locked down read-only, you can't just `kubectl exec` into the pod and tweak `/etc/nginx/nginx.conf` when you want to test something. That might feel a bit frustrating at first, but it saves you from making random one-off changes on a node that you forget to save anywhere.
+
+The clean way to handle this is putting your config in a ConfigMap and mounting it straight into `/etc/nginx/conf.d/`:
 
 ```yaml
 apiVersion: v1
@@ -134,7 +134,7 @@ data:
     }
 ```
 
-Then in the pod spec:
+Then in your deployment, mount the ConfigMap as read-only:
 
 ```yaml
 volumeMounts:
@@ -148,24 +148,22 @@ volumes:
       name: nginx-config
 ```
 
-The `readOnly: true` on the volume mount is an extra belt-and-suspenders measure — the config directory shouldn't be writable at runtime anyway. Rolling out a config change becomes a `kubectl apply` on the ConfigMap followed by a pod restart (or a Deployment rollout), giving you a full audit trail in Git.
+Any time you need to update routing or headers, you change the ConfigMap in Git, apply it, and roll the pod. You get an audit trail of every change without touching a running shell.
 
-## Kubernetes Pod Security Standards — Namespace Labels
+## Turning on restricted security cluster-wide
 
-To actually enforce these constraints cluster-wide, label your namespace:
+To make sure your cluster actually enforces these rules, label your namespace:
 
 ```bash
-kubectl label namespace <your-ns> \
+kubectl label namespace web \
   pod-security.kubernetes.io/enforce=restricted \
   pod-security.kubernetes.io/enforce-version=latest
 ```
 
-With `enforce=restricted`, any pod that omits `runAsNonRoot`, leaves `allowPrivilegeEscalation` unset (it defaults to `true`), or tries to mount a writable root is rejected before it ever schedules. The `warn` and `audit` modes are useful during migration — they emit warnings or audit log entries without blocking, letting you find non-compliant workloads before flipping to `enforce`.
+With `enforce=restricted` turned on, any pod that forgets `runAsNonRoot`, leaves `allowPrivilegeEscalation` true, or tries to run with a writable root gets rejected immediately. 
 
-Note that `baseline` stops short of requiring a read-only root filesystem or non-root UIDs, so if you're only at baseline today, the `nginx:latest` container might actually run — but you're leaving risk on the table.
+If you are migrating existing apps and do not want to break things right away, swap `enforce` for `audit` or `warn` first. That way Kubernetes logs the offenders or warns you in the CLI without killing the workload, giving you time to clean up the manifests.
 
-## Takeaway
+## Wrapping up
 
-Hardening Nginx in Kubernetes is less about the web server itself and more about meeting the expectations of a security-conscious runtime environment. The combination of `nginxinc/nginx-unprivileged`, a tight `securityContext`, `emptyDir` volumes for scratch paths, and ConfigMap-managed configuration lets you satisfy the restricted Pod Security Standard without heroics. Each constraint — non-root UID, no privilege escalation, read-only root, dropped capabilities — has a concrete security rationale, and together they meaningfully shrink the blast radius if something in the serving stack is ever exploited.
-
-If you're running anything in a homelab or production cluster that you care about, restricted PSS enforcement on your application namespaces is a low-effort, high-value control. Start with `audit` mode, fix the warnings, then flip to `enforce`.
+Getting unprivileged Nginx working properly in Kubernetes takes a bit of troubleshooting upfront. You have to handle the non-standard port on 8080, carve out `emptyDir` volumes for scratch directories, and keep your config in ConfigMaps. But once you have that pattern down, the container runs smoothly, passes restricted security checks without complaining, and keeps your cluster that much safer.

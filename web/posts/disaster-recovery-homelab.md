@@ -1,167 +1,115 @@
 ---
-title: Disaster Recovery in a Homelab: Backup Strategy, Restore Procedures, and Lessons from Real Rebuild Drills
+title: Disaster Recovery in My Homelab: Rebuild from Scratch in 33 Minutes
 date: 2026-11-22
-readTime: 9
+readTime: 10
 tags: homelab, kubernetes, disaster-recovery, infrastructure
-summary: How I approach disaster recovery for a five-node Talos Linux cluster — rebuild from code, restore only durable data — including two timed rebuild drills that cut recovery time from 70 minutes to 33 minutes.
+summary: Why I refuse to back up etcd, how CloudNativePG restores databases from S3, and the real bugs caught during timed rebuild drills.
 ---
 
-**TL;DR:** My homelab DR philosophy is simple: the cluster itself is disposable. Everything that matters lives outside it — manifests in Git, database backups in S3, secrets in OpenBao, photos on ZFS. When something breaks badly enough, I `terraform apply` and let ArgoCD do the rest. This post documents where state lives, how each piece is backed up, the exact restore order, and what two timed drills taught me.
+Most Kubernetes backup guides spend a lot of time talking about etcd snapshots. You take a snapshot of your control plane state, store it somewhere safe, and hope that if disaster strikes, you can restore that exact etcd database back onto a fresh machine.
 
----
+I decided not to back up etcd at all. 
 
-## The Philosophy: Rebuild, Don't Rescue
+That is not an accident or a shortcut. Trying to nurse an old etcd database back to life on broken nodes is a recipe for weird bugs and configuration drift. Instead, I treat the entire cluster as completely disposable. 
 
-Traditional DR thinking for Kubernetes often starts with etcd snapshots — back up the control plane state, restore it in an emergency. I deliberately chose the opposite approach.
+All my cluster manifests live in Git. Secrets live in an external OpenBao vault. Database backups stream to S3 on MinIO. Bulk photos sit on TrueNAS with ZFS snapshots. 
 
-**etcd is not backed up.** Not because I forgot, but because it's the wrong thing to protect. If etcd is the source of truth, you have a cluster-shaped dependency that's hard to restore correctly and easy to get wrong. Instead, **Git is the source of truth for cluster state**, and **S3-compatible object storage is the source of truth for data**. The cluster is a runtime artifact of those two things.
+If my Kubernetes cluster gets corrupted or both Proxmox servers die, I don't try to salvage the wreckage. I run `terraform apply` to build fresh VMs, install the CNI, hand off to ArgoCD, and let CloudNativePG restore the databases from S3. 
 
-This means a full rebuild — from bare Proxmox VMs to running workloads — is a *tested, exercised path*, not a theoretical one. That distinction matters enormously.
+Here is how that disaster recovery strategy works in real life, and what happened when I timed myself doing it.
 
----
+## Where the data actually lives
 
-## Where State Actually Lives
+Before you can build a recovery plan, you have to be completely honest about where your data is stored. In my lab, anything permanent lives outside the cluster:
 
-Before you can design a recovery procedure, you have to be honest about where every piece of durable state lives. Here's mine:
+- Cluster manifests: Stored in Git and managed with ArgoCD.
+- Terraform state: Saved on my TrueNAS storage.
+- Postgres databases: Streamed continuously to S3 buckets on MinIO using Barman.
+- Cluster secrets: Held in OpenBao on a separate VM outside Kubernetes, backed up by Proxmox Backup Server.
+- Photos and family media: TrueNAS ZFS dataset backed up to off-site storage and Backblaze B2.
 
-| State | Location | Backup mechanism |
-|---|---|---|
-| Cluster manifests | Git (ArgoCD app-of-apps) | Git history + remote |
-| Terraform state | NAS (unencrypted — documented limitation) | NAS itself |
-| CNPG PostgreSQL databases | MinIO on TrueNAS (S3, WAL archiving) | Barman + ScheduledBackup CRs |
-| Secrets | OpenBao VM (outside cluster) | Proxmox Backup Server + Raft snapshots |
-| Immich photos | TrueNAS ZFS dataset (NFS) | ZFS snapshots + off-site + Backblaze B2 |
+Notice what is missing from that list: pods, API server state, ConfigMaps, and etcd. Those are all temporary runtime objects. When the cluster goes down, they disappear, and when Terraform runs, they get rebuilt cleanly from code.
 
-Notice what's *not* in that table: the Kubernetes API server, running pods, ConfigMaps derived from Git, anything ephemeral. Those are all reconstructed on rebuild. The goal is to keep the "durable" list as short and well-understood as possible.
+## Restoring databases with CloudNativePG
 
----
+I run four separate PostgreSQL database clusters using CloudNativePG: `coroot-db`, `immich-db`, `authentik-db`, and `grafana-db`. 
 
-## Database Backups: CNPG + Barman + WAL Archiving
+All four clusters continuously ship their write-ahead logs (WAL) to MinIO over S3 with gzip compression. Scheduled full backups run overnight on staggered timers so they don't hammer the storage array all at once:
 
-The cluster runs four **CloudNative-PG** clusters — `coroot-db`, `immich-db`, `authentik-db`, and `grafana-db` — all in the `database-system` namespace. Each has two instances with `podAntiAffinity: required` so they spread across nodes automatically.
+- `coroot-db`: 00:00 UTC
+- `immich-db`: 00:10 UTC
+- `authentik-db`: 00:20 UTC
+- `grafana-db`: 01:00 UTC
 
-Backups flow through **Barman** to **MinIO** (hosted on TrueNAS), configured as an S3-compatible target (`s3://database-backup/<db-name>`). WAL archiving runs continuously with **gzip compression**. Scheduled full backups are staggered to avoid simultaneous load:
+### The init vs restore trap
 
-```
-coroot-db:    00:00 UTC
-immich-db:    00:10 UTC
-authentik-db: 00:20 UTC  (immediate: true)
-grafana-db:   01:00 UTC  (immediate: true)
-```
+This is the single most important operational trick in the entire database setup, and if you forget it during a rebuild, you will kick yourself.
 
-`immediate: true` on the authentik and grafana backups means the first backup runs at deploy time rather than waiting for the next scheduled window — useful after a fresh cluster build.
+Every database in my repo has two manifests:
 
-### The Init/Restore Manifest Pattern
+`init-db.yaml` uses `bootstrap.initdb` to create a fresh, empty database.
 
-This is the most operationally important detail in the whole database setup, and the one most likely to bite you if you forget it.
+`restore-db.yaml` uses `bootstrap.recovery` to pull WAL logs and base backups down from MinIO.
 
-Each database has **two manifests**:
+If you rebuild your cluster and let ArgoCD sync `init-db.yaml` first, CloudNativePG will spin up a brand new empty database, start accepting connections, and treat that blank database as the new baseline. Once that happens, you have to wipe the database and start over.
 
-- `init-db.yaml` — uses `bootstrap.initdb`, creates a fresh empty database
-- `restore-db.yaml` — uses `bootstrap.recovery` with `externalClusters` pointing at the S3 backup path
+To recover properly, you have to swap `init-db.yaml` to `restore-db.yaml` in Git before the first ArgoCD sync runs. That way, the moment CloudNativePG boots, it sees the recovery instructions and pulls down the data from S3.
 
-**The restore manifest must be committed to Git *before* the first ArgoCD sync after a rebuild.** If ArgoCD reconciles with the init manifest first, CNPG creates an empty database, starts accepting connections, and that empty state becomes the new baseline. Recovery from that point means wiping and starting over.
+There is one more catch: you have to change the `serverName` field on recovery. CloudNativePG uses `serverName` as the S3 folder prefix for new WAL segments. If you reuse the old name, the recovering database will overwrite the backup files you are actively trying to restore from. I just append a suffix like `-restore-1` to keep them separate.
 
-The workflow on a full rebuild:
-1. Before running `terraform apply`, swap `init-db.yaml` → `restore-db.yaml` for each DB in Git and push.
-2. ArgoCD syncs and CNPG sees `bootstrap.recovery` on first contact — it pulls WAL and base backups from MinIO.
-3. After recovery is confirmed, swap back to `init-db.yaml` for future clean installs.
+## The recovery order
 
-There's one more subtlety: **the `serverName` field must be changed on recovery**. CNPG uses `serverName` as the S3 path prefix for new WAL segments. If you reuse the old name, the recovering cluster will overwrite the backup you're trying to restore from. The convention here is to append a suffix like `-restore-1` and increment it on each drill.
+You cannot just run commands randomly during a recovery. Almost every tool in the stack relies on something upstream being alive first:
 
-A ready-to-use `grafana-db.yaml.restore` already exists in the repo for exactly this reason.
+1. Network and DNS: The physical network, local DNS, and Proxmox hosts have to be up.
+2. TrueNAS: MinIO (for database backups) and NFS storage (for photos) must be reachable.
+3. OpenBao: You must unseal the vault VM so External Secrets Operator can fetch credentials.
+4. Terraform state: Verify the NAS share holding your Terraform state is accessible.
+5. `terraform apply`: Builds the VMs, configures Talos Linux, bootstraps etcd, installs Cilium and Longhorn, and bootstraps ArgoCD.
+6. ArgoCD sync: Sync waves pull down manifests in sequence, External Secrets populates passwords, and CloudNativePG restores the databases.
 
----
+In Terraform, I have an ugly 300-second `time_sleep` right after installing Cilium. Cilium takes a minute or two to register its custom resource definitions, and without that hard sleep, Terraform rushes ahead and crashes trying to apply dependent resources. It is not pretty, but it works every single time.
 
-## Secrets: OpenBao Outside the Cluster
+## What the timed drills actually taught me
 
-**OpenBao** runs as a dedicated VM outside the Kubernetes cluster, accessed at `https://bao.g-space.co.za/`. Keeping it external is intentional — the cluster needs secrets to start, so the secret store can't depend on the cluster being up.
+You can write down the prettiest recovery runbook in the world, but until you wipe your cluster and set a stopwatch, you are just guessing.
 
-In-cluster workloads access OpenBao via **External Secrets Operator** using AppRole auth. The ESO `ClusterSecretStore` uses the Vault provider (OpenBao is API-compatible). Secrets are read from `secret/data/staging/*` under a read-only policy.
+### Drill 1: October 2026 (Untimed)
 
-OpenBao is backed up two ways:
-- **Proxmox Backup Server**: whole-VM backup on a schedule
-- **Cron Raft snapshots**: periodic `vault operator raft snapshot save` exported to a known location
+This was my proof of concept. I manually deleted the VMs, ran Terraform, restored databases from MinIO, and proved that rebuilding from code was actually possible. I didn't time it because I had to pause and fix small config issues along the way, but it gave me confidence that the architecture worked.
 
-One documented limitation: **OpenBao was configured by hand**, not with Terraform or OpenTofu. That means the restore procedure for OpenBao itself is less automated than everything else. The restore time for OpenBao has not been drilled end-to-end — a known gap.
+### Drill 2: November 19, 2026 (70 minutes)
 
----
+This was the first timed run. It started at 9:41 and finished at 10:51, clocking in at about 70 minutes. More importantly, it uncovered three real bugs:
 
-## Recovery Order and Why It Matters
+First, the Talos image sitting on my Proxmox host was outdated. I had bumped the Talos version in Terraform earlier that week, but hadn't downloaded the matching custom factory image with the iSCSI storage modules to Proxmox. The VMs failed to boot on the first pass.
 
-Order matters because almost everything has an upstream dependency. Try to bring up ArgoCD before OpenBao is unsealed, and ESO will fail to fetch secrets. Try to restore databases before MinIO is reachable, and CNPG's recovery controller will time out.
+Second, the Helm repositories on my laptop were stale. Terraform pulled old chart definitions, which threw errors when trying to fetch specific package versions.
 
-The practiced recovery order:
+Third, the sync waves for External Secrets Operator were wrong. The operator and its custom resource definitions were in the same wave, so ArgoCD tried to create `ExternalSecret` resources before the API server recognized what an ExternalSecret was.
 
-1. **Network, DNS, Proxmox** — foundation layer; nothing else works without it
-2. **TrueNAS** — MinIO (S3 for database backups) and NFS (Immich photos) live here
-3. **OpenBao** — unseal it; ESO will need it before most apps can start
-4. **Terraform state** — confirm NAS is accessible and state file is intact
-5. **`terraform apply`** — rebuilds VMs, applies Talos configs, bootstraps etcd, installs Cilium + Longhorn + ArgoCD, applies `root-app.yaml`
-6. **ArgoCD reconciles** — sync waves enforce dependency order the rest of the way
+Every single one of these was a hidden bug that never showed up during day-to-day use. If I had waited for a real hardware failure to find them, I would have spent hours debugging in a panic.
 
-The Terraform bootstrap itself is fully scripted and sequenced. One noteworthy detail: a **300-second `time_sleep`** was added after Cilium installation because CRDs were not reliably available in time for the next steps. It's inelegant, but it's reliable — the alternative was intermittent failures that were harder to diagnose than a fixed wait.
+### Drill 3: November 22, 2026 (33 minutes)
 
-ArgoCD sync waves handle application-layer ordering:
+Three weeks later, with those three fixes committed to Git, I ran the exact same drill. It started at 17:10 and finished at 17:43. 
 
-```
--10: namespaces
- -9: CRDs
- -8: operators
- -6: ClusterSecretStore
- -5: ExternalSecrets
-  2: CNPG clusters + storage
-  3: credential-sync Jobs
-  5: applications
- 10: post-deploy / validation
-```
+The entire cluster came back up cleanly in 33 minutes. The only manual thing I had to touch was clicking a single sync button on the monitoring stack. Going from 70 minutes down to 33 minutes came entirely from fixing the bugs surfaced in the previous drill.
 
----
+## Being honest about what is not tested yet
 
-## Drill Results: Actual Numbers
+I am happy with how fast the Kubernetes cluster recovers, but there are still gaps in my backup strategy that I haven't tested:
 
-Planning a recovery procedure is not the same as having one. The only way to know if your DR works is to run it.
+Off-site restore from Backblaze B2 has never been drilled. My TrueNAS replicates ZFS snapshots to an off-site server and to Backblaze B2. But I have never taken a clean TrueNAS box and pulled data back down from B2. That is still an assumption.
 
-### October 2026 — First Full Rebuild (Untimed)
+MinIO cloud backup needs verification. I need to double-check whether the TrueNAS zvol hosting MinIO is included in the off-site replication job, or if it is only sitting on local storage.
 
-Goal: prove end-to-end rebuild is possible. Databases were restored from S3. No timing recorded — the goal was just to validate the path, not optimize it. It worked, with some manual intervention.
+Restoring OpenBao from scratch has not been timed. The OpenBao VM is backed up by Proxmox Backup Server, but I haven't timed a full restore and unseal process from zero.
 
-### November 19, 2026 — Second Drill: 9:41 → 10:51 (~70 minutes)
+## The takeaway
 
-First timed drill. Three bugs surfaced:
+An untested backup is just a wish. 
 
-- **Stale Talos image on Proxmox host** — the custom Talos factory image (with `iscsi_tcp`, `nbd`, and `rpcsec_gss_krb5` modules for Longhorn/NFS) had not been updated on the host after a Talos version bump. First boot failed.
-- **Helm repos not updated** — Terraform references specific chart versions; repos on the bootstrap machine were stale and chart pulls failed.
-- **ESO CRD sync wave wrong** — External Secrets Operator CRDs were not installed before the operator tried to reconcile, causing a sync failure. Fixed by moving CRD installation to wave `-9` and the operator to wave `-8`.
+Running rebuild drills is uncomfortable because you know things are going to break. You will sit there watching error logs scroll by, wondering why a pod is crash looping or why a Helm chart won't download. 
 
-All three were real bugs that would have caused a failed recovery in a genuine incident. Finding them in a drill is exactly the point.
-
-### November 22, 2026 — Third Drill: 17:10 → 17:43 (~33 minutes)
-
-Same procedure, bugs from the previous drill fixed. Clean rebuild. The only manual step needed was triggering the monitoring stack sync — not a blocker, but noted for the next run.
-
-**70 minutes → 33 minutes** between two drills, three weeks apart.
-
----
-
-## Known Gaps
-
-Honesty about what hasn't been tested is as important as the parts that work:
-
-- **Off-site NAS restore is untested.** ZFS snapshots replicate off-site and to Backblaze B2, but pulling from B2 back to a fresh TrueNAS has never been drilled. It's an assumption, not a known-good path.
-- **MinIO zvol cloud replication coverage is unconfirmed.** The database backup target (MinIO on TrueNAS) may or may not be included in cloud replication — this needs verification.
-- **OpenBao restore has not been timed.** The VM backup exists, but walking through an actual restore of OpenBao from PBS and re-unsealing it has not been drilled as a standalone procedure.
-
----
-
-## Lessons
-
-**Untested backups are assumptions, not backups.** The October drill turned a theoretical design into a proven one. The November drills turned a proven design into a *fast* one.
-
-**Drill logs are an artifact worth keeping.** Timestamps, error messages, and the sequence of what broke tell you exactly where your runbook is wrong. Without them, you're fixing the same bugs twice.
-
-**Dependency ordering is the hardest part of recovery.** It's not obvious until something fails that ESO needs CRDs, that CRDs need the operator, and that the operator needs the namespace. Sync waves make this explicit and machine-enforced — not dependent on whoever is running the drill remembering the order.
-
-**Every drill found something new.** The first drill validated the path. The second found three real bugs. The third ran clean. The pattern suggests one more drill will reveal whatever the third one missed — probably something in the OpenBao or off-site restore path.
-
-The goal isn't a perfect DR plan on paper. It's a DR plan that gets shorter and more reliable every time it's exercised.
+That friction is the whole point. Every bug you find while sitting calmly at your desk on a weekend is a bug that won't ruin your life when a real drive fails. Build your cluster as code, test your restores, and don't be afraid to pull the plug.

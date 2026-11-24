@@ -3,20 +3,20 @@ title: Automating Image Updates with Renovate and ArgoCD
 date: 2026-08-25
 readTime: 7
 tags: kubernetes, gitops
-summary: A look into pushing static build artifacts to container registries and triggering seamless GitOps deployments via Renovate pull requests — including how Renovate runs as a Kubernetes CronJob, how secrets stay out of Git, and where the current limitations are.
+summary: How I run Renovate as a Kubernetes CronJob to keep Helm charts and container tags updated without giving SaaS tools access to my cluster.
 ---
 
-Automating container deployments using GitOps avoids manual `kubectl apply` commands while keeping every change auditable in Git. This post covers how **Renovate Bot** and **ArgoCD** work together in my homelab cluster — specifically the self-hosted setup, the secret management wiring, and the honest trade-offs that remain.
+Keeping container images and Helm charts updated in Kubernetes is one of those chores you always put off. You set up your cluster, everything is working, and three months later you realize you are running outdated software with known security patches sitting on GitHub.
 
-## Why Self-Host Renovate?
+The usual way people handle this is by connecting an external SaaS bot to their GitHub account. 
 
-Renovate is commonly run as a GitHub App or through the hosted Mend SaaS service. For a homelab with private repositories and secrets stored in **OpenBao**, neither option was ideal. Running Renovate as a **Kubernetes CronJob** keeps the entire update pipeline inside the cluster, using the same secret management infrastructure as everything else.
+For my homelab, I didn't want an external service holding credentials to my private repos. I already had OpenBao running outside the cluster to manage secrets, so it made a lot more sense to self-host Renovate directly inside Kubernetes as a scheduled CronJob.
 
-The Renovate pod has no long-lived credentials baked into it. The GitHub token is sourced from **OpenBao** via the **External Secrets Operator (ESO)**, the same path used for Grafana admin credentials, Cloudflare tokens, and database passwords across the cluster.
+Here is how Renovate and ArgoCD work together to keep my cluster up to date, how secrets stay protected, and why I still review every pull request by hand.
 
-## How Renovate Is Deployed
+## Running Renovate as a CronJob
 
-Renovate runs in the `renovate-system` namespace as a **Kubernetes CronJob** that fires every two hours:
+Instead of running a heavy persistent server, Renovate runs inside the `renovate-system` namespace as a lightweight Kubernetes CronJob that fires every two hours:
 
 ```yaml
 apiVersion: batch/v1
@@ -33,14 +33,17 @@ spec:
           containers:
             - name: renovate
               image: ghcr.io/renovatebot/renovate
-              # ... env, volumeMounts
 ```
 
-The Renovate configuration itself lives in a **ConfigMap** that is mounted into the container at runtime. This keeps the config version-controlled alongside everything else without embedding it into the image or the CronJob spec directly.
+The configuration for Renovate lives in a ConfigMap mounted into the container at runtime. That keeps the configuration version-controlled in Git without baking anything into custom container images.
 
-### Secrets Without Hardcoding
+## Keeping GitHub tokens out of Git
 
-The GitHub token Renovate needs to open pull requests is stored in OpenBao at `secret/staging/renovate`. An **ExternalSecret** resource pulls it into the cluster as a Kubernetes Secret:
+To open pull requests on GitHub, Renovate needs a personal access token. 
+
+Instead of hardcoding that token or baking it into a secret file in Git, it lives inside OpenBao under `secret/data/staging/renovate`. 
+
+An `ExternalSecret` resource tells the External Secrets Operator to pull that token from OpenBao and create a Kubernetes secret in the `renovate-system` namespace:
 
 ```yaml
 apiVersion: external-secrets.io/v1beta1
@@ -51,81 +54,59 @@ metadata:
 spec:
   refreshInterval: 1h
   secretStoreRef:
-    name: openbao-cluster-secret-store
+    name: openbao
     kind: ClusterSecretStore
   target:
     name: renovate-github-token
   data:
     - secretKey: token
       remoteRef:
-        key: secret/data/staging/renovate
+        key: staging/renovate
         property: github_token
 ```
 
-The `ClusterSecretStore` authenticates to OpenBao using **AppRole**, with the `role_id` committed in Git and the `secret_id` injected at bootstrap. No token ever appears in a manifest or in Terraform state — the ESO controller fetches it at runtime and refreshes every hour.
+The Renovate pod grabs the token from the secret on startup, runs its checks, opens any needed PRs, and exits. No long-lived credentials sit exposed in the repository.
 
-## Tracking Container Images with Inline Annotations
+## Tracking raw container images with inline comments
 
-For **Helm chart** updates, Renovate discovers versions automatically by scanning `Chart.yaml` and `values.yaml` files. For raw Kubernetes manifests that reference container images directly, Renovate needs a hint.
+For Helm charts, Renovate is smart enough to scan `Chart.yaml` and `values.yaml` files automatically. 
 
-The pattern is a one-line comment immediately above the image field:
+For raw Kubernetes manifests that reference container image tags directly, Renovate needs a small hint so it knows what to watch. 
+
+You can add a simple one-line comment directly above the `image:` line:
 
 ```yaml
 # renovate: datasource=docker depName=cloudflare/cloudflared
 image: cloudflare/cloudflared:2024.6.1
 ```
 
-This tells Renovate which datasource and package name to use when checking for updates. When a new version of `cloudflare/cloudflared` is published to Docker Hub, Renovate opens a pull request that updates the tag on that line. The comment itself stays untouched — it persists across updates and continues directing future scans.
+Renovate reads that comment, checks Docker Hub for newer releases of `cloudflare/cloudflared`, and opens a pull request updating the tag. The comment stays in place, so future updates keep working without you having to reconfigure anything.
 
-In the same repository, Renovate manages both **Helm chart versions** and **container image tags**, so a single tool covers the full dependency surface.
+## The pull request flow
 
-## The PR-First Update Flow
+When Renovate finds an update for a Helm chart or container tag, the process works like this:
 
-When Renovate finds an update — whether a new Helm chart version or a new container image tag — the flow is:
+1. Renovate opens a pull request on GitHub with the version diff and release notes.
+2. I review the PR on my phone or laptop to check if there are breaking changes.
+3. Once I merge the pull request into `main`, ArgoCD detects the change.
+4. ArgoCD pulls the updated manifest and rolls the new container out to the cluster.
 
-1. **Renovate opens a PR** on GitHub with the diff (e.g., `cloudflared: 2024.6.1 → 2024.7.0`).
-2. **Review**: the engineer reads the changelog, checks whether the update is breaking, and approves.
-3. **GitHub Actions** run security and lint checks against the PR branch.
-4. **Merge to `main`**: once checks pass and review is done.
-5. **ArgoCD detects the drift**: with `automated` sync, `selfHeal: true`, and `prune: true` enabled, ArgoCD continuously compares the live cluster state against `main`. After the merge, it detects the diff and applies the updated manifest to the cluster — no manual `kubectl` command needed.
+Because ArgoCD runs with `selfHeal: true`, the only way to update a service is by merging a change into `main`. If you try to manually edit a pod image using `kubectl`, ArgoCD notices the drift and rolls it back to match Git.
 
-```
-[Renovate CronJob] → [GitHub PR] → [Review + CI] → [Merge to main]
-                                                          ↓
-                                               [ArgoCD detects diff]
-                                                          ↓
-                                               [ArgoCD syncs cluster]
-```
+## What is still missing
 
-This gives every image update an explicit, human-reviewed audit trail. The Git log on `main` is the source of truth for what version of every workload is running in the cluster.
+There are two shortcuts in this setup that I am working to improve:
 
-## What selfHeal Actually Means
+Every update requires a manual click. Renovate supports automatically merging patch-level security updates, but I haven't turned that on yet. 
 
-ArgoCD's `selfHeal: true` policy does two things:
+The reason I haven't turned on auto-merge is that I don't have automated manifest validation in GitHub Actions yet. If Renovate opens a PR with a Helm value change that breaks YAML syntax, GitHub would happily auto-merge it, and the error would only surface when ArgoCD crashed during sync. 
 
-- **After a merge**: ArgoCD reconciles the new desired state from Git.
-- **After drift**: if someone runs a `kubectl apply` or `kubectl edit` directly against the cluster, ArgoCD reverts it back to what Git says.
+Once I add a `kubeconform` linting step to my GitHub Actions workflow, I can safely let Renovate auto-merge minor patch releases while keeping major upgrades manual.
 
-This makes the PR review step non-optional in practice. The only way to change what runs in the cluster is to change what is in `main` — either through a Renovate PR or a manually authored one. Direct cluster mutations don't survive the next sync cycle.
+## Why this workflow works so well
 
-## Current Limitations
+Self-hosting Renovate inside Kubernetes gives you the best of both worlds. 
 
-This setup works well but has two documented gaps worth being honest about:
+You don't have to give third-party SaaS services access to your private repos, and your tokens stay secured in OpenBao. 
 
-**No auto-merge for patch updates yet.** Renovate supports automatically merging patch-level version bumps after CI passes. That is not enabled here — every PR still requires a manual merge. The blocker is that CI does not yet validate Kubernetes manifests (no `kubeval`, `kubeconform`, or dry-run apply step), so it is not safe to auto-merge without that gate in place. A bad manifest would only be caught at ArgoCD sync time.
-
-**No manifest validation in CI.** If a Renovate PR introduces a structurally invalid manifest — for example, a Helm values change that generates bad YAML — the GitHub Actions checks will pass, the PR can be merged, and the problem surfaces when ArgoCD tries to apply it. Adding a `kubeconform` or `helm template | kubeval` step to CI is the fix, but it is not implemented yet.
-
-Both are known gaps. The honest trade-off is: the pipeline is fast to set up and covers the common case well, but it shifts some validation responsibility to the ArgoCD sync step rather than catching errors earlier.
-
-## What This Demonstrates
-
-Running Renovate as a CronJob rather than a SaaS service means the dependency update pipeline is:
-
-- **Fully self-contained** — no external service has access to the GitHub token or the repository.
-- **Consistent with the rest of the secret management** — same OpenBao/ESO path as every other credential in the cluster.
-- **GitOps-native** — every change, whether a Helm chart bump or a container image tag update, goes through a PR and an ArgoCD sync. No imperative paths exist.
-
-The inline annotation pattern for image tracking (`# renovate: datasource=docker depName=...`) is a small but important detail: it makes raw YAML manifests as trackable as Helm charts, without requiring a separate configuration file per image.
-
-For a homelab used as a learning environment and portfolio project, the PR-per-update workflow also creates a natural history of what changed, when, and why — which is exactly what you want when you are demonstrating operational discipline to a potential employer.
+When you sit down at your computer, you don't have to manually hunt down version numbers across twenty different tools. You just review a list of clean pull requests with release notes attached, click merge, and let GitOps handle the rest.

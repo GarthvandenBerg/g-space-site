@@ -1,190 +1,131 @@
 ---
-title: Homelab Architecture Overview — Talos Linux on Proxmox VE
+title: How My Homelab Actually Works: Talos Linux on Proxmox
 date: 2026-11-22
-readTime: 9
+readTime: 10
 tags: homelab, kubernetes, talos, infrastructure
-summary: A ground-up walkthrough of my homelab Kubernetes platform — Talos Linux running on Proxmox VE, bootstrapped with Terraform, operated with ArgoCD, and designed around the principle of rebuilding rather than repairing.
+summary: Walking through my five-node Talos cluster on Proxmox, how Terraform and ArgoCD run the show, and why the whole thing is built to be wiped and rebuilt in half an hour.
 ---
 
-**TL;DR:** This is a production-grade homelab Kubernetes cluster running Talos Linux on two Proxmox VE hosts, fully bootstrapped with Terraform, and operated via GitOps with ArgoCD. It exists primarily as a learning platform for end-to-end platform engineering: infrastructure as code, secrets management, CNI internals, GitOps patterns, and disaster recovery. This post is the architecture index — every component has a dedicated deep-dive linked from here.
+Most homelab setups start with someone running a quick script on a single server, getting a couple of containers running, and calling it a day. That is great for messing around on a weekend, but it doesn't teach you how production systems actually behave when real traffic hits or when something catches fire.
 
----
+I wanted to build a lab that forced me to learn platform engineering the hard way: managing infrastructure entirely as code, handling networking with eBPF, keeping secrets out of Git, and practicing disaster recovery by deliberately destroying the cluster and timing how fast it comes back.
 
-## Why I Built This
+This is the big picture walkthrough of how the whole platform fits together, warts and all.
 
-I built this homelab to learn platform engineering the way it actually works in production, not the way a tutorial presents it. That means dealing with real dependencies between components, real failure modes, and real trade-offs — not a managed Kubernetes service that abstracts the hard parts away.
+## The physical servers
 
-The specific goals were:
+The whole setup runs on two physical Proxmox VE hosts, which I named after Star Trek captains:
 
-- Understand how a Kubernetes cluster is actually assembled from scratch (CNI, kube-proxy replacement, control-plane bootstrapping)
-- Practice **Infrastructure as Code** discipline end-to-end, from VM creation to application deployment
-- Build and repeatedly drill a credible **disaster recovery** runbook
-- Run real workloads (photos, identity, monitoring) so the cluster has stakes
+`kirk` is the primary Proxmox machine, carrying two control plane nodes and one worker.
 
-This is not a "spin up a Kind cluster" project. Every layer — from the UEFI VM config in Terraform to the sync waves in ArgoCD — is a deliberate choice I can explain and defend.
+`picard` is the second host, carrying one control plane and one worker.
 
----
+To prevent split-brain issues with Proxmox cluster quorum, I have a tiny third machine acting as a QDevice. It doesn't run any heavy VMs; it just votes in Corosync so the two main hosts don't fight over who is in charge if network connectivity blips. It also runs Uptime Kuma to monitor the lab from the outside.
 
-## Physical Topology
+If either `kirk` or `picard` dies completely, the surviving host stays up and Kubernetes keeps the workloads running.
 
-The cluster runs on two physical Proxmox VE hosts and a lightweight QDevice for quorum.
+## The Kubernetes nodes
 
-| Host | Role | Notes |
-|---|---|---|
-| **kirk** | Primary Proxmox host | Runs 2 control planes + 1 worker |
-| **picard** | Secondary Proxmox host | Runs 1 control plane + 1 worker |
-| **QDevice** | Corosync quorum device | Also runs Uptime Kuma for external monitoring |
+Inside Proxmox, the cluster runs five virtual machines, all powered by Talos Linux:
 
-The two-host setup means I can tolerate a single host failure on the Proxmox layer. The QDevice prevents split-brain without requiring a third full host.
+- `talos-ctl-1` (2 vCPU, 5 GB RAM on kirk)
+- `talos-ctl-2` (2 vCPU, 5 GB RAM on kirk)
+- `talos-ctl-3` (2 vCPU, 5 GB RAM on picard)
+- `talos-worker-1` (6 vCPU, 16 GB RAM on kirk)
+- `talos-worker-2` (4 vCPU, 10 GB RAM on picard)
 
-### Kubernetes Node Inventory
+All node specs live in a simple `nodes.yaml` file in the repository. When I run Terraform, it loops through that YAML file and builds the VMs automatically with UEFI boot, virtio-scsi storage, and dedicated VLAN bridges. Adding or upgrading a node is just changing a line in that file.
 
-All five nodes are Talos Linux VMs (**Talos v1.14.6**, **Kubernetes v1.37.2**). The node inventory is driven by a `nodes.yaml` file — Terraform loops over it to create every VM, so adding a node is a one-line YAML change.
+Workloads are blocked from running on the control planes so system components always have breathing room. 
 
-| Node | Role | vCPU | RAM | Disk | Host |
-|---|---|---|---|---|---|
-| talos-ctl-1 | Control plane | 2 | 5 GB | 50 GB | kirk |
-| talos-ctl-2 | Control plane | 2 | 5 GB | 50 GB | kirk |
-| talos-ctl-3 | Control plane | 2 | 5 GB | 50 GB | picard |
-| talos-worker-1 | Worker | 6 | 16 GB | 200 GB | kirk |
-| talos-worker-2 | Worker | 4 | 10 GB | 200 GB | picard |
+For the Kubernetes API, I use Talos's built-in Layer 2 VIP at `192.168.2.5`. If the control plane node holding that IP drops offline, another control plane takes over the address automatically. I don't need to spin up separate HAProxy or keepalived VMs just to talk to the cluster.
 
-Control planes are explicitly **not schedulable** (`allowSchedulingOnControlPlanes: false`). The control-plane API is exposed via a **Layer 2 VIP at 192.168.2.5**, so a control-plane failure doesn't require a DNS change — the VIP floats to a healthy node automatically.
+## Splitting the work: Terraform and ArgoCD
 
-All VMs use OVMF/UEFI firmware, q35 machine type, `virtio-scsi-single`, and a VirtIO NIC on a dedicated VLAN2 bridge.
+One rule I stuck to is having a very clear split between provisioning bare infrastructure and running applications.
 
----
+### 1. Terraform builds the foundation
 
-## Logical Architecture
+Terraform is responsible for everything that has to exist before Kubernetes can even think about running apps:
 
-The stack is organised into three distinct layers, each responsible for a different concern:
+It creates the Proxmox VMs, pulls our custom Talos image from the Image Factory with extra kernel modules for storage, pushes the machine configs to every node, and bootstraps etcd. 
 
-### Layer 1 — Terraform Bootstrap
+Once the Kubernetes API is healthy, Terraform installs Cilium for networking, Longhorn for storage, and bootstraps ArgoCD via Helm. Finally, it drops the repository credentials and secrets into the cluster, applies the root ArgoCD application manifest, and steps back.
 
-Terraform owns everything that must exist *before* GitOps can take over:
+From that second onward, Terraform is done. It does not touch application manifests.
 
-1. Create Proxmox VMs from the `nodes.yaml` inventory (providers: `bpg/proxmox`, `siderolabs/talos`)
-2. Pull a custom Talos image from `factory.talos.dev` — the schematic includes extra kernel modules (`iscsi_tcp`, `nbd`, `rpcsec_gss_krb5`) required for Longhorn and NFS
-3. Apply Talos machine configs (shared patch, control-plane patch, VIP patch, worker patch)
-4. Bootstrap etcd, wait for the Kubernetes API to become healthy
-5. Install **Cilium** via Helm — with a forced 300-second wait after installation because CRDs weren't reliably ready otherwise
-6. Install **Longhorn** and **ArgoCD** via Helm
-7. Apply the root ArgoCD `Application` manifest, handing control to GitOps
-8. Inject the ArgoCD repo credentials and the OpenBao AppRole secret as Kubernetes Secrets
+### 2. ArgoCD runs the workloads
 
-After step 8, Terraform steps back. Everything else is owned by Git.
+ArgoCD takes over where Terraform leaves off. It uses the app-of-apps pattern, where one root application points to child applications for infrastructure tools, staging apps, and monitoring.
 
-### Layer 2 — GitOps (ArgoCD)
+Everything is set to auto-sync with self-healing turned on. If I get impatient and manually tweak something with `kubectl edit`, ArgoCD will detect the drift within minutes and overwrite it back to what Git says. 
 
-ArgoCD runs the **app-of-apps pattern**: a single root `Application` defines four child Applications — `infrastructure-staging`, `apps-staging`, `monitoring-staging`, and `apps-prod` (prepared but not yet deployed).
+To keep things from crashing into each other on boot, ArgoCD sync waves enforce the deployment order. Namespaces and CRDs get built first, then the secrets operators, then storage and databases, and finally the user applications.
 
-Sync policy is `automated`, with `prune=true` and `selfHeal=true`. If a resource drifts from Git, ArgoCD corrects it within minutes.
+## What is actually running in the cluster?
 
-**Sync waves** enforce dependency order across the infrastructure layer:
+I run real workloads in this lab so that breaking things actually has consequences:
 
-| Wave | What deploys |
-|---|---|
-| -10 | Namespaces |
-| -9 | CRDs |
-| -8 | Operators (ESO, CNPG, Longhorn, Coroot) |
-| -6 | ClusterSecretStore |
-| -5 | ExternalSecrets (pull credentials from OpenBao) |
-| 2 | CNPG database clusters, storage |
-| 3 | Credential-sync Jobs |
-| 5 | Applications (Immich, Authentik, etc.) |
-| 10 | Post-deploy / validation |
+- **Immich:** Self-hosted photo management for my family. It uses TrueNAS NFS shares for bulk photos and a dedicated Postgres database.
+- **Authentik:** Single sign-on and identity provider that secures internal services.
+- **Personal sites and blog:** Hosted right here on this cluster, routed through Cloudflare Tunnels so no inbound router ports are exposed to the public internet.
+- **Minecraft:** A game server running on local persistent storage so friends can jump on.
+- **Renovate:** A scheduled job that checks our Helm charts and container tags every two hours, opening pull requests automatically when updates drop.
 
-Kustomize overlays (`base/` + `staging/` + `production/`) allow the same manifests to target different environments with minimal duplication.
+## How data and secrets are handled
 
-### Layer 3 — Workloads
+Storage and state are where most Kubernetes setups turn into a nightmare if you don't plan ahead.
 
-Workloads currently deployed:
+### Databases with CloudNativePG
 
-- **Immich** — self-hosted photo library, NFS storage from TrueNAS, CNPG PostgreSQL backend
-- **Authentik** — identity provider with CNPG backend
-- **Personal websites / blog** — served via Cloudflare Tunnel and Gateway API HTTPRoutes
-- **Minecraft** — game server with Longhorn persistent storage
-- **Renovate** — CronJob running every 2 hours, opens PRs for Helm and container image updates
+I run four separate PostgreSQL instances (for Immich, Authentik, Coroot, and Grafana) using the CloudNativePG operator. 
 
----
+Each database runs two instances with anti-affinity rules so they never sit on the same physical host. I specifically put them on local node SSDs (`local-path`) instead of distributed block storage. Since CloudNativePG already handles replication between the database pods, putting them on top of replicated storage like Longhorn would just waste CPU and double-write everything.
 
-## Key Components
+Every database streams its write-ahead logs (WAL) to an S3 bucket on MinIO, and full backups run overnight. If a database goes belly up, there are ready-to-go `restore-db.yaml` files in the repo to restore the cluster from S3.
 
-### Cilium — CNI and Load Balancer
+### Keeping secrets out of Git with OpenBao
 
-Cilium runs in **full kube-proxy replacement mode** (`kubeProxyReplacement: true`), talking directly to the Talos local API (`localhost:7445`). **BPF masquerade** is enabled. L2 announcements handle LoadBalancer IPs in the `192.168.2.200–240` range, with the local gateway at `192.168.2.240`. Gateway API is enabled, which powers the Cloudflare Tunnel integration.
+Secrets never get committed to Git. I run OpenBao (an open-source fork of HashiCorp Vault) on a separate VM outside Kubernetes at `bao.g-space.co.za`. 
 
-Hubble is enabled for flow visibility but is not yet actively used for policy generation — that's a known gap.
+Inside the cluster, External Secrets Operator (ESO) talks to OpenBao using Vault AppRoles. When an application needs a database password or API token, ESO fetches it from OpenBao and creates a native Kubernetes secret in memory. If you look at the Git repository, you only see references to secret paths, never actual passwords.
 
-### ArgoCD — GitOps Controller
+### Networking and public access
 
-ArgoCD is the single source of truth for cluster state after bootstrap. The UI is reachable at `192.168.2.206`. Every manifest change goes through a Git PR; ArgoCD reconciles within seconds of merge.
+For internal networking, Cilium handles all CNI routing and replaces kube-proxy entirely using eBPF. 
 
-### CloudNative-PG — Databases
+For public access, I don't forward any ports on my home router. Everything goes through Cloudflare Tunnels using the `cfgate` operator and Gateway API HTTPRoutes. The tunnel establishes an outbound connection to Cloudflare, and Cloudflare routes public traffic in securely. 
 
-Four PostgreSQL clusters (Immich, Authentik, Coroot, Grafana) each run as independent CNPG clusters with 2 instances and `podAntiAffinity=required` to spread across nodes. Storage is intentionally **`local-path`** (node-local SSDs) rather than Longhorn — CNPG already replicates at the application layer, so using Longhorn would double-replicate unnecessarily.
+For private admin access, I use a NetBird WireGuard mesh combined with a Caddy reverse proxy running in a Proxmox container, secured with internal DNS.
 
-All databases ship WAL continuously to MinIO S3 with gzip compression. Full backups are taken on staggered schedules overnight. Ready-to-use restore manifests (`restore-db.yaml`) live in the repo for each cluster.
+## The rebuild mindset
 
-### OpenBao + External Secrets Operator — Secrets Management
+A lot of homelab guides tell you how to set up complex backups for etcd. I deliberately chose not to back up etcd at all.
 
-**OpenBao** (an open-source Vault fork) runs on a dedicated VM outside the cluster, accessible at `https://bao.g-space.co.za/`. Secrets never touch Git. The ESO **ClusterSecretStore** uses Vault AppRole auth (the `roleId` is committed to the repo; `secret_id` is not). AppRole tokens have a 1-hour TTL, bound to the cluster node CIDR. ESO pulls secrets from `secret/data/staging/*` with a read-only policy.
+In this cluster, etcd is treated as completely disposable. All my configuration is in Git. All database data is safely backed up to MinIO S3 and TrueNAS ZFS snapshots. Secrets live outside the cluster in OpenBao. 
 
-OpenBao is backed up two ways: Proxmox Backup Server snapshots the whole VM, and a cron job takes Raft snapshots.
+If both Proxmox hosts explode tomorrow, I don't try to stitch together an old etcd database. I run `terraform apply`, let it build fresh VMs and install ArgoCD, and let GitOps pull down the apps while CloudNativePG restores the databases from S3.
 
-### Cloudflare Tunnel — Public Exposure
+In my last timed drill, going from a completely wiped cluster to fully reconciled applications took about 33 minutes.
 
-Public-facing services go through **Cloudflare Tunnel** (`cfgate`), managed by the `cfgate.io` operator using Gateway API `HTTPRoute` resources. Two `cloudflared` replicas run for redundancy. No inbound firewall ports are opened. DNS records are synced automatically from `HTTPRoute` annotations via a `CloudflareDNS` resource (zone: `g-space.co.za`).
+## Being upfront about what is still broken
 
-### NetBird + Caddy — Private Access
+No homelab is ever truly finished, and mine has plenty of shortcuts I haven't fixed yet:
 
-Private services (Immich for friends and family) are accessed via **NetBird** WireGuard mesh. Caddy runs in an Alpine LXC container on Proxmox, in an HA pair with `keepalived` VRRP (VIP `192.168.70.244`, priorities 101/100). TLS certificates are issued via Cloudflare DNS-01 challenge. Internal DNS is handled by a Technitium DNS cluster.
+Terraform state is sitting unencrypted on my NAS. That state file contains bootstrap credentials and tokens, which is a real security risk until I migrate it to an encrypted backend.
 
----
+OpenBao was configured manually. While the Kubernetes cluster is 100% automated, the OpenBao VM was configured through the web UI and bash commands. If that VM dies, I have to restore it from a Proxmox image backup.
 
-## Design Philosophy
+The AppRole secret ID does not expire. I set `secret_id_ttl=0` during setup so I wouldn't have to deal with automated rotation while learning the basics. 
 
-Four principles shaped every decision:
+There are no network policies. All pods can talk to all other pods across the cluster. I have Cilium Hubble running, but I haven't taken the time to write strict firewall policies between namespaces.
 
-1. **Immutable OS.** Talos Linux has no SSH daemon, no package manager, no shell. Config is applied declaratively via API. Nodes are configured, not administered.
+The worker nodes are uneven. One worker has 16 GB of RAM and 6 cores, while the other has 10 GB and 4 cores, because that is the hardware I had available on those two machines.
 
-2. **Git as the source of truth.** If it isn't in Git, it doesn't exist. ArgoCD's `selfHeal=true` enforces this — manual `kubectl apply` changes are reverted automatically.
+## Why this approach matters
 
-3. **Durable state lives outside the cluster.** Databases back up to S3 (MinIO). Secrets live in OpenBao. Talos configs and Kubernetes manifests live in Git. etcd is *intentionally not backed up* — if etcd is gone, the cluster is rebuilt from code and data restored from S3.
+The point of doing all this in a homelab isn't to look fancy on the internet. It is about getting over the fear of breaking things. 
 
-4. **Rebuild over repair.** The disaster recovery posture is: wipe everything, run `terraform apply`, let ArgoCD reconcile. Drills have been run three times:
-   - **October 2026** — untimed first run, identified gaps
-   - **November 19, 2026** — ~70 minutes, found and fixed the ESO CRD sync wave bug, stale Talos image, and stale Helm repos
-   - **November 22, 2026** — ~33 minutes, clean except for a manual monitoring sync
+When you spend your days working on production infrastructure, you learn that things will inevitably fail: hardware dies, network routes drop, and software updates break dependencies. If you build systems that rely on you remembering what you clicked in a web console six months ago, you will be terrified of touching them.
 
----
-
-## Known Limitations
-
-I'd rather document these than pretend they don't exist:
-
-- **Terraform state is unencrypted on the NAS.** It contains kubeconfig, Talos certs, and bootstrap secrets. This is a risk; the fix is to migrate to an encrypted remote backend.
-- **OpenBao is configured by hand.** Policies, auth methods, and mounts were set up manually. It should be codified with Terraform/OpenTofu.
-- **AppRole `secret_id_ttl=0` (never expires).** The AppRole secret ID doesn't rotate. The plan is to bind it with a TTL and automate rotation.
-- **No NetworkPolicy or CiliumNetworkPolicy defined.** All pods can reach all pods. Hubble is enabled but unused.
-- **No in-cluster AlertManager delivery.** Alerting runs through Uptime Kuma on the QDevice and delivers via Discord webhook. Prometheus AlertManager is deployed but not wired to a delivery channel.
-- **`apps-prod` overlay exists but is not deployed.** The production environment is prepared but not running.
-- **Off-site NAS restore never tested.** The backup path exists; the restore path has not been drilled end-to-end.
-- **MinIO cloud replication coverage unconfirmed.** It's unclear whether the MinIO zvol is included in cloud replication.
-- **Worker nodes are asymmetric.** `talos-worker-1` has 6 vCPU / 16 GB; `talos-worker-2` has 4 vCPU / 10 GB. Scheduling is not perfectly balanced.
-
----
-
-## What's Coming
-
-This post is the index. Each component listed above has (or will have) a dedicated post covering implementation details, trade-offs, and lessons learned:
-
-- Terraform bootstrap deep dive
-- Cilium configuration and L2 announcements
-- Secrets management with OpenBao and ESO
-- CloudNative-PG: multi-cluster PostgreSQL with WAL archiving
-- Disaster recovery: drills, runbooks, and what broke
-- Cloudflare Tunnel + Gateway API for zero-inbound-port public exposure
-- Monitoring stack: kube-prometheus-stack, Coroot, and Uptime Kuma
-
-If you're a hiring manager or engineer evaluating this: the repo is the artifact. The decisions are documented, the trade-offs are acknowledged, and the disaster recovery has been drilled — not just planned.
+Once you force yourself to write everything as code, test your disaster recovery with a stopwatch, and treat your servers like cattle, running Kubernetes stops being stressful and actually becomes fun.

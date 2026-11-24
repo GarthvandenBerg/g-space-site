@@ -1,124 +1,124 @@
 ---
-title: Terraform Bootstrap and the Two-Layer IaC Design
+title: "Terraform Bootstrap: How I Split Infrastructure and GitOps"
 date: 2026-11-22
 readTime: 9
 tags: homelab, kubernetes, infrastructure, gitops
-summary: How I use Terraform to bootstrap a Talos Linux cluster on Proxmox — provisioning VMs, applying machine configs, bootstrapping etcd, and handing off to ArgoCD — and why the split between the two layers matters.
+summary: Solving the chicken-and-egg problem of bootstrapping Kubernetes, and why Terraform should step aside the moment ArgoCD wakes up.
 ---
 
-TL;DR: Terraform has one job — build everything ArgoCD needs to exist so it can take over. Once ArgoCD is running and the root app is applied, Git becomes the source of truth for everything else. This post covers what that bootstrap sequence looks like, what each Terraform resource is responsible for, and the trade-offs I made along the way.
+When building a Kubernetes cluster with Infrastructure as Code, you immediately run into a chicken-and-egg problem. 
 
-## The Two-Layer Philosophy
+You want GitOps to manage everything in your cluster. But before ArgoCD can manage your cluster, you need a Kubernetes cluster to run ArgoCD. And before you have a Kubernetes cluster, you need virtual machines, an operating system, and networking.
 
-Infrastructure as Code for a Kubernetes cluster has a bootstrapping problem: before GitOps can manage your cluster, the cluster has to exist. That circularity is exactly what Terraform is for in this setup.
+A lot of homelab setups try to force one tool to do everything. Either they use Terraform to deploy application Helm charts and manage workloads, or they write complicated bash scripts that run half in Git and half on a laptop.
 
-**Layer 1 — Terraform:** Provisions the physical (virtual) substrate. VMs, Talos machine configuration, etcd bootstrap, the CNI, and ArgoCD itself. These are the things that *must* exist before anything else can run. Terraform is the right tool here because this layer deals with declarative resources that have no higher-level controller to reconcile them — there is no operator watching Proxmox and creating VMs.
+I decided on a strict two-layer rule for my homelab:
 
-**Layer 2 — ArgoCD (GitOps):** Once ArgoCD is running and a root Application is applied, it owns everything above the platform layer. App workloads, most infrastructure components, secrets synchronisation, monitoring — all of it is reconciled from Git. The rule is simple: if ArgoCD can manage it, it should. Terraform should not drift into managing things that belong to layer two.
+Terraform has one job: build the foundation up to the point where ArgoCD can stand on its own two feet. 
 
-The boundary is not arbitrary. It reflects *who can run what, and when*. Terraform can run from a laptop with a kubeconfig. ArgoCD needs a cluster, a CNI, and a Git repo credential to function. Terraform creates all three; ArgoCD owns the rest.
+Once ArgoCD is running and takes over the root application manifest, Terraform steps away completely. It never touches user workloads, application databases, or internal policies.
 
-## What Terraform Manages
+Here is how the bootstrap sequence works, and why keeping that seam clean makes full cluster rebuilds fast and predictable.
 
-### Proxmox VMs
+## The Proxmox inventory: nodes.yaml
 
-The cluster runs on two Proxmox VE hosts — `kirk` (primary: 2 control planes + 1 worker) and `picard` (1 control plane + 1 worker) — plus a QDevice for quorum. All five Talos nodes are defined in a **`nodes.yaml` inventory file** that Terraform loops over.
+The cluster runs five Talos Linux nodes across two Proxmox hosts (`kirk` and `picard`). Instead of writing individual Terraform blocks for each VM, all five nodes are defined in a clean `nodes.yaml` file:
 
-Each entry in `nodes.yaml` carries: `name`, `ip`, `type` (control-plane or worker), `platform` (proxmox or cloud), `nodename`, `storage_pool`, and `mac`. That MAC address is deliberate — it pins the VM to a static DHCP reservation on the network, so IP addresses are stable across rebuilds without Terraform managing DHCP itself.
+- `talos-ctl-1` (kirk)
+- `talos-ctl-2` (kirk)
+- `talos-ctl-3` (picard)
+- `talos-worker-1` (kirk)
+- `talos-worker-2` (picard)
 
-The top-level cluster metadata lives alongside the node list: `cluster_name`, `talos_version` (v1.14.6), `kube_version` (v1.37.2), and a `factory_id` pointing to a custom Talos image schematic.
+Each entry defines the VM name, IP address, hardware sizing, storage pool, and MAC address. Setting explicit MAC addresses is a deliberate trick: it locks each VM to a static DHCP reservation on my home router. That way, nodes always get the exact same IP addresses across rebuilds without Terraform needing to manage DHCP directly.
 
-The `proxmox_virtual_environment_vm` resource creates each VM with:
-- **OVMF/UEFI** firmware (not legacy BIOS)
-- **q35** machine type
-- **virtio-scsi-single** disk controller
-- **virtio NIC** on a VLAN2 bridge
-- The Talos disk image pulled from `factory.talos.dev` using the `factory_id` — a custom schematic that includes the `iscsi_tcp`, `nbd`, and `rpcsec_gss_krb5` kernel modules required by Longhorn and NFS
+Terraform loops over that YAML file and uses the `bpg/proxmox` provider to create the VMs with UEFI firmware, virtio-scsi disk controllers, and custom Talos images pulled from `factory.talos.dev`.
 
-Control planes are sized at 2 vCPU / 5 GB RAM / 50 GB disk. Workers vary: the `kirk` worker gets 6 vCPU / 16 GB / 200 GB, the `picard` worker gets 4 vCPU / 10 GB / 200 GB.
+## Talos machine configs and etcd bootstrap
 
-### Talos Machine Configuration
+Once the VMs exist, Terraform uses the `siderolabs/talos` provider to generate the cluster PKI and certificates with `talos_machine_secrets`. 
 
-The **`talos_machine_secrets`** resource generates the cluster PKI — certificates, keys, and bootstrap tokens. Everything Talos nodes need to trust each other and to authenticate the API comes out of this single resource.
+Next, it applies machine config patches to each node:
 
-**`talos_machine_configuration_apply`** then renders and applies a machine config to each node. Patches are layered by node role and platform:
+- `shared-patch.yaml`: Turns off the built-in CNI, disables kube-proxy, loads kernel storage modules (`iscsi_tcp` and `nbd`), and configures local disks.
+- `ctl-patch.yaml`: Disables workload scheduling on control plane nodes.
+- `vip-patch.yaml`: Sets up a shared Layer 2 VIP at `192.168.2.5` across the control planes.
+- `worker-patch.yaml`: Applies worker-specific settings.
 
-- `shared-patch.yaml` — CNI set to `none`, kube-proxy disabled, disk `/dev/sda` with wipe, kernel modules (`iscsi_tcp`, `nbd`, `libiscsi`, `rpcsec_gss_krb5`), kubelet extra mounts for Longhorn/CNI/local-path/Tetragon, host DNS disabled
-- `ctl-patch.yaml` — `allowSchedulingOnControlPlanes: false` (control planes are not schedulable)
-- `vip-patch.yaml` — Layer2 VIP `192.168.2.5` on `net0`, applied only to Proxmox control planes; this is the stable API endpoint the kubeconfig points to
-- `worker-patch.yaml` — worker-specific settings
+Once configs are pushed, Terraform fires `talos_machine_bootstrap` on the first control plane node to initialize etcd. 
 
-### etcd Bootstrap and API Readiness
+Right after bootstrap, I have a 90-second wait followed by a bash loop that polls port 6443 on the VIP. That keeps Terraform from rushing ahead before the Kubernetes API server has actually started accepting requests.
 
-**`talos_machine_bootstrap`** runs against the first control plane to initialise the etcd cluster. This is a one-time operation — if it runs again on an already-bootstrapped node, Talos rejects it gracefully, but Terraform tracks it in state so it only fires once.
+## Installing the network and the 300-second sleep
 
-After bootstrap, there is a **`null_resource.wait_for_api`** that runs a bash loop polling TCP port 6443 on the VIP address. Without this, subsequent Helm and kubectl steps race against an API server that may not be ready to accept connections.
+Before ArgoCD can schedule pods, the cluster needs a working network. 
 
-There is also a **`time_sleep`** of 90 seconds immediately after bootstrap — a guard against the window where etcd is elected but the API server has not yet started.
+Terraform applies the Gateway API CRDs and installs Cilium using Helm, pointing it at Talos's local KubePrism proxy on `localhost:7445`. 
 
-### CNI: Cilium
+Right after the Cilium install, I put in a 300-second `time_sleep`. 
 
-Cilium is installed via **`helm_release.cilium`** before ArgoCD. This is intentional: ArgoCD itself needs a functioning CNI to schedule its own pods. Cilium is configured with `kubeProxyReplacement: true`, pointing at the Talos local API proxy (`k8sServiceHost: localhost`, `k8sServicePort: 7445`). Gateway API and L2 announcements are enabled.
+Is a 5-minute hard sleep pretty? No. But Cilium registers multiple custom resource definitions in the background, and without that wait, downstream steps intermittently crashed because the CRDs weren't ready yet. A 5-minute wait makes the whole bootstrap sequence rock solid every time.
 
-Gateway API CRDs are applied separately using **`kubectl_manifest.gateway_api_crds`**, which downloads the CRD manifest from GitHub and applies it ahead of Cilium's own configuration. CRDs must exist before Helm can reference them.
+## Handing the keys to ArgoCD
 
-After Cilium installs, there is a **`time_sleep` of 300 seconds** before proceeding. This was added to fix a real race condition: CRDs were not reliably ready by the time the next resources tried to use them, causing intermittent failures on fresh installs. Five minutes is conservative, but it makes the bootstrap reliably idempotent.
+With networking stable, Terraform installs ArgoCD via Helm. Before ArgoCD can start pulling manifests from Git, it needs two secrets created in the cluster:
 
-### ArgoCD and the Root App
+1. The ArgoCD repository credentials, so it can read my private GitOps repo.
+2. The `openbao-approle` secret, containing the `secret_id` that External Secrets Operator needs to authenticate to our vault.
 
-ArgoCD is installed via **`helm_release`** after Cilium stabilises. Before ArgoCD can sync anything, it needs two secrets injected as Kubernetes Secrets by Terraform:
+The `secret_id` is passed into Terraform as an environment variable and never committed to Git.
 
-- **`openbao-approle` Secret** — contains the OpenBao AppRole `role_id` and `secret_id` that the External Secrets Operator uses to authenticate to OpenBao. The `role_id` (`67fc1871-62db-2257-6416-852bbf189d1d`) is committed in Git; the `secret_id` is passed in as a Terraform variable and never written to the repository.
-- **ArgoCD repo credentials Secret** — gives ArgoCD access to the private Git repository so it can begin syncing.
+Finally, Terraform applies `root-app.yaml`. This is the master ArgoCD Application that points to our child applications in Git (`infrastructure-staging`, `apps-staging`, and `monitoring-staging`). 
 
-Finally, **`kubectl_manifest`** applies the root `app.yaml`. This is the ArgoCD Application that defines the app-of-apps: four child Applications (`infrastructure-staging`, `apps-staging`, `apps-prod`, `monitoring-staging`) that ArgoCD then reconciles from Git. At this point, Terraform's job is done.
+The second that root app is applied, Terraform's job is finished.
 
-## Sensitive Outputs
+## The bootstrap sequence from start to finish
 
-Terraform outputs the `talosconfig` and `kubeconfig` as sensitive values (`sensitive = true`). They are written to temp files during bootstrap so that subsequent Helm and kubectl providers can authenticate. These are not stored in the repository.
+Here is the exact order of operations when running `terraform apply`:
 
-## Bootstrap Sequence, End to End
+1. Create VMs in Proxmox from `nodes.yaml`.
+2. Push Talos machine config patches to all nodes.
+3. Bootstrap etcd on the first control plane.
+4. Wait 90 seconds and poll port 6443 until the API responds.
+5. Apply Gateway API CRDs.
+6. Install Cilium via Helm.
+7. Wait 300 seconds for Cilium CRDs to settle.
+8. Install ArgoCD via Helm.
+9. Inject the OpenBao AppRole secret and Git repo credentials.
+10. Apply `root-app.yaml` to hand control over to GitOps.
 
-```
-1. proxmox_virtual_environment_vm       — create all VMs
-2. talos_machine_configuration_apply   — apply patches per node
-3. talos_machine_bootstrap             — bootstrap etcd on first CP
-4. time_sleep (90s)                    — wait for API server to start
-5. null_resource.wait_for_api          — poll :6443 until ready
-6. kubectl_manifest.gateway_api_crds   — apply Gateway API CRDs
-7. helm_release.cilium                 — install Cilium
-8. time_sleep (300s)                   — wait for CRDs to settle
-9. helm_release.argocd                 — install ArgoCD
-10. kubectl_manifest (secrets)         — inject openbao-approle + repo creds
-11. kubectl_manifest (root-app.yaml)   — ArgoCD takes over
-```
+In my last timed drill, this entire sequence ran completely unattended in about 33 minutes.
 
-This sequence has been validated through multiple full cluster rebuilds: the most recent run on 22 November 2026 completed in approximately 33 minutes.
+## What Terraform does NOT manage
 
-## What Terraform Does NOT Manage
+Everything above the foundation layer lives in Git and is reconciled by ArgoCD:
 
-Everything above the platform layer lives in Git and is reconciled by ArgoCD:
+- User apps like Immich, Authentik, the personal websites, and Minecraft
+- Longhorn storage operator
+- External Secrets Operator and secret stores
+- CloudNativePG database clusters
+- Prometheus, Grafana, and Coroot
+- Cloudflare Tunnels and DNS records
+- Renovate update jobs
 
-- Application workloads (Immich, Authentik, Minecraft, the blog)
-- Longhorn storage (installed by ArgoCD now, not Terraform)
-- External Secrets Operator and ClusterSecretStore
-- CloudNative-PG clusters and databases
-- Monitoring stack (kube-prometheus-stack, Grafana, Coroot)
-- Cloudflare Tunnel and DNS
-- Renovate CronJob
+If a tool can be declared as a Kubernetes manifest, it belongs in GitOps. Having Terraform manage in-cluster application resources creates split-brain headaches where you can't tell whether Git or Terraform is in charge.
 
-If it can be expressed as a Kubernetes manifest and reconciled by ArgoCD, it should be. Terraform managing Kubernetes objects beyond the bootstrap secrets creates split-brain risk — the same resource managed in two places.
+## Honest gaps in my setup
 
-## Known Limitations
+There are still a couple of areas in the Terraform layer that need work:
 
-**Unencrypted Terraform state.** State is stored on a NAS share. It contains the Talos PKI and bootstrap credentials generated by `talos_machine_secrets`. This is a documented gap. The plan is to migrate to **OpenTofu** and enable state encryption, which OpenTofu supports natively without requiring a remote backend.
+Terraform state is unencrypted on my NAS. That state file contains bootstrap certificates and tokens. I plan to migrate to OpenTofu so I can use native state encryption without needing a complex remote backend.
 
-**OpenBao not codified.** OpenBao itself is configured by hand — policies, AppRole, mounts. It is backed up via Proxmox Backup Server and cron Raft snapshots, but a full rebuild would require manually reconfiguring it before Terraform can inject the approle secret. Codifying this with OpenTofu is on the roadmap.
+OpenBao was configured manually. While the Kubernetes cluster is fully automated with Terraform, the OpenBao VM was configured through the CLI by hand. Codifying OpenBao setup into Terraform is on my backlog.
 
-**`secret_id_ttl = 0`.** The AppRole secret ID never expires. This is a convenience for a homelab but a gap against least-privilege best practice. The plan is to introduce TTL-bound secret IDs with automated rotation.
+The AppRole secret ID does not expire. I set `secret_id_ttl=0` during initial testing so I wouldn't have to build automated rotation right away.
 
-## What This Design Demonstrates
+## Why the split matters
 
-The two-layer approach makes the cluster **reproducible by design**. Terraform handles the parts that cannot bootstrap themselves; ArgoCD handles everything that can be declared in Git. The separation keeps each tool doing what it is good at — Terraform as a provisioner, ArgoCD as a reconciler — without either one overreaching into the other's domain.
+Splitting your setup into two clean layers prevents tools from fighting each other. 
 
-Running timed rebuild drills (the November 22 rebuild came in at ~33 minutes) validates that the design holds under real failure conditions, not just in theory. Each drill has surfaced at least one real bug — a sync wave ordering issue with ESO CRDs, a stale Talos image on the Proxmox host — and those fixes are committed back into the codebase, making each subsequent rebuild faster and cleaner.
+Terraform does what it does best: talking to the Proxmox API, creating VMs, and standing up the base cluster. 
+
+ArgoCD does what it does best: watching Git, syncing manifests, and keeping workloads running. 
+
+By keeping that boundary clear and testing it with rebuild drills, you get an infrastructure you can trust and rebuild at a moment's notice.

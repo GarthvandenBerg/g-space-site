@@ -1,166 +1,118 @@
 ---
-title: Lessons Learned — Reflections from Building a Production-Habits Homelab
+title: Real Lessons from Breaking and Rebuilding My Homelab
 date: 2026-11-22
 readTime: 9
 tags: homelab, kubernetes, infrastructure
-summary: After three cluster rebuild drills (two of them timed), two Proxmox hosts, and an honest gap analysis, here is what I learned building a production-style Kubernetes homelab — and what I would do differently.
+summary: Wiping a five-node cluster to see how long it takes to recover, and the three bugs that only showed up when everything was deleted.
 ---
 
-**TL;DR:** I built a five-node **Talos Linux** Kubernetes cluster on two **Proxmox VE** hosts, managed entirely through **Infrastructure as Code** (Terraform) and **GitOps** (ArgoCD). The most valuable lessons came from **disaster recovery drills**, not from the initial build: a timed rebuild exposed three latent bugs, and fixing them cut the rebuild from **~70 minutes to ~33 minutes**. This post covers the six lessons that stuck, the gaps I have not fixed yet, and the roadmap.
+Building a Kubernetes cluster the first time is pretty straightforward. You follow the guides, get pods running, see green checkmarks in your dashboard, and feel pretty good about yourself. 
 
-When I started this project, the goal was a Kubernetes homelab that behaved less like a weekend experiment and more like a small production environment: real workloads, practiced recovery, Git as the source of truth, and documented gaps. What I did not expect was how much of the learning would come from *operating* the cluster and *breaking it on purpose*, rather than from building it.
+The real test comes when you pull the plug on purpose to see if you can bring it back from the dead.
 
----
+I built a five-node Talos Linux cluster across two Proxmox servers (`kirk` and `picard`). Everything is provisioned from code with Terraform and managed through GitOps with ArgoCD. But instead of just letting it sit there once it worked, I decided to run disaster recovery drills. I wiped the nodes, set a timer on my phone, and watched where the whole setup broke down.
 
-## What I Set Out to Do
+Here is what I learned from doing that, including the messy bits and the shortcuts I still need to clean up.
 
-The target architecture:
+## The timed drills: 70 minutes down to 33 minutes
 
-- **Five-node Talos Linux cluster** (three control planes, two workers) on two Proxmox VE hosts (`kirk` and `picard`)
-- **Bootstrapped entirely from code:** Terraform provisions the VMs, applies Talos machine configs, bootstraps etcd, installs Cilium, and hands off to ArgoCD
-- **GitOps** with **ArgoCD** managing the application layer
-- **Secrets management** with **OpenBao** and the **External Secrets Operator (ESO)**
-- **Recoverable by design:** actual rebuild drills, not just written runbooks
+You don't really know if your backups or automation work until you wipe your cluster and try to stand it back up from zero. 
 
----
+I did three full rebuild drills:
 
-## The Six Lessons That Actually Stuck
+The first run was back in October. It was untimed and mostly about seeing if the general idea worked. 
 
-### 1. Dependency ordering is everything
+The second run in mid-November was timed, and it took about 70 minutes. More importantly, it uncovered three real bugs that never would have shown up during normal day-to-day operation:
 
-Ordering assumptions that are only implicit will eventually fail. The classic example is a *CRD-not-found* error because an operator deployed before its CRDs were registered. These errors look like configuration bugs but are really **timing bugs**.
+1. The Talos image sitting on my Proxmox host was outdated, so new nodes were pulling old software.
+2. The Helm repositories on my provisioning machine hadn't been updated, which caused package pull errors mid-deploy.
+3. The External Secrets Operator (ESO) CRD sync wave was out of order, so application secrets failed to deploy on a clean run.
 
-ArgoCD **sync waves** are the right tool, but you have to commit to them. My wave assignments:
+That ESO bug is a classic example of a hidden timing issue. While the cluster was running normally, everything looked completely healthy because the custom resource definitions already existed. It was only when I wiped the cluster and stood it up from scratch that the race condition popped up. 
 
-```
+By fixing those three issues, the third drill a few days later took about 33 minutes from running `terraform apply` to having a fully healthy cluster with all applications synced in ArgoCD. 
+
+Having a written runbook makes you feel prepared, but actually timing a recovery gives you real data on where your bottlenecks are.
+
+## Sync waves: why order matters
+
+When ArgoCD syncs a repo, Kubernetes tries to create resources as fast as it can in parallel. If you don't explicitly tell it the order things need to happen in, you get slapped with CRD-not-found errors and broken deployments.
+
+I use ArgoCD sync waves to force things into a strict sequence:
+
+```text
 -10: namespaces
  -9: CRDs
  -8: operators
  -6: ClusterSecretStore
  -5: ExternalSecrets
-  2: CNPG clusters + storage
-  3: credential-sync Jobs
+  2: CloudNativePG clusters and storage
+  3: credential-sync jobs
   5: applications
- 10: post-deploy / validation
+ 10: post-deploy validation
 ```
 
-These reflect real dependency chains:
+This reflects how dependencies actually work in the real world:
 
-- The ESO operator cannot function until its CRDs exist.
-- The `ClusterSecretStore` cannot authenticate until OpenBao is reachable.
-- CloudNativePG (CNPG) clusters cannot start until their credential secrets are populated.
+The External Secrets operator cannot do anything until its CRDs are registered in the API.
 
-The same principle applies at the infrastructure layer. Terraform runs: **VM creation → Talos config → etcd bootstrap → API readiness → Cilium → Longhorn → ArgoCD → root app**. Recovery has an order too: **network and DNS → TrueNAS → OpenBao unsealed → Terraform state accessible → `terraform apply`**.
+The `ClusterSecretStore` cannot authenticate until OpenBao is reachable over the network.
 
-**Key takeaway:** Make ordering explicit everywhere — sync waves, Terraform `depends_on`, and recovery runbooks.
+Postgres databases managed by CloudNativePG cannot initialize until their database password secrets exist.
 
-### 2. Test your restores — the drills found real bugs
+The same thing applies to Terraform when bootstrapping the bare nodes: VM creation leads into Talos machine configuration, which leads into etcd bootstrap, then Cilium CNI, Longhorn storage, and finally ArgoCD. If you don't make ordering explicit everywhere, things will eventually fail on a fresh deploy.
 
-| Drill | Date | Result |
-|---|---|---|
-| 1 | October 2026 | Untimed proof of concept |
-| 2 | November 19, 2026 | **~70 minutes**, timed, found **three real bugs** |
-| 3 | November 22, 2026 | **~33 minutes**, clean apart from one manual nudge on the monitoring stack |
+## The ugly 300-second sleep
 
-The three bugs found in drill 2:
+Speaking of ordering, not everything in Terraform is clean. 
 
-1. The **Talos image on the Proxmox host was stale**
-2. **Helm repos on the provisioning machine** had not been updated
-3. The **ESO CRD sync wave was misconfigured**, so ExternalSecrets failed on a clean apply
+When Terraform installs Cilium via Helm, Cilium has to start up and register its custom resource definitions before downstream resources can reference them. But Terraform doesn't have a built-in way to poll for "are these CRDs ready yet?"
 
-The ESO bug is a good example of a *latent* failure. In steady state everything looked healthy because the CRDs already existed. Only a from-scratch bootstrap exposed the ordering problem.
+My fix? A 300-second `time_sleep` resource right after the Cilium install. 
 
-The **37-minute improvement** between drills 2 and 3 came entirely from fixing what drill 2 surfaced. That is a measurement, not an estimate.
+Is a 5-minute hard sleep ugly? Absolutely. But it is completely predictable, and it keeps Terraform from crashing while Cilium finishes settling into the nodes. Sometimes in homelabs you pick the simple, slightly hacky fix that works every time over an over-engineered script that breaks when you least expect it.
 
-**Key takeaway:** An untested restore is not a backup. The untimed October drill gave me confidence; the timed November drill gave me data.
+## Why I don't back up etcd
 
-### 3. Durable state outside the cluster changes what "disaster" means
+This might sound crazy to some Kubernetes admins, but I deliberately do not back up etcd. 
 
-Where state lives determines how bad a failure is:
+In my setup, etcd is treated as disposable runtime state. All the desired state for the cluster lives in Git. All the actual data that matters lives outside the cluster:
 
-- **Manifests:** Git
-- **Database backups (WAL and base backups):** MinIO S3, restored with Barman/CNPG
-- **Photos:** TrueNAS with ZFS snapshots
-- **Secrets:** OpenBao, outside the cluster, protected by Proxmox Backup Server and Raft snapshots
+- Application manifests are in Git repositories.
+- Database base backups and write-ahead logs go to MinIO S3 storage, managed by CloudNativePG and Barman.
+- Family photos and bulk media live on TrueNAS with ZFS snapshots.
+- Cluster secrets are stored in OpenBao outside Kubernetes, backed up to Proxmox Backup Server.
 
-Because of this, a total cluster loss is a **rebuild event, not a catastrophe**. I deliberately chose **not** to back up etcd: desired state is in Git and data is in S3/NFS, so etcd is a runtime artifact. `terraform apply` reconstitutes the cluster, ArgoCD reconciles the application layer, and databases restore from backup.
+Because none of the permanent state lives exclusively inside the cluster, losing the entire cluster is just a rebuild event rather than a disaster. Running `terraform apply` stands the nodes back up, ArgoCD pulls the manifests from Git, and the databases restore their data from S3. 
 
-The ~33 minute figure is the **cluster rebuild time**. It is mostly waiting on Terraform to provision VMs and on ArgoCD to sync, not heroic recovery effort.
+Most of that 33-minute rebuild time is just waiting for VMs to clone on Proxmox and container images to download. There is no frantic manual rescue mission needed.
 
-**Key takeaway:** Durable state placement is an architectural decision, not an operational detail. Know exactly what lives where, and verify it with drills.
+## The learning curve of an API-only OS
 
-### 4. The immutable OS removes a class of problems — and raises the debugging skill floor
+Talos Linux gets rid of configuration drift by completely removing SSH and bash shells. Every single node setting is defined in a YAML patch file and applied through `talosctl`.
 
-**Talos Linux** has no SSH, no package manager, and no interactive shell. Every change goes through the Talos API (`talosctl`) as a declarative patch. This nearly eliminates **configuration drift**: you cannot log in and install something that is not captured in code.
+That sounds fantastic on paper, but it raises the bar on troubleshooting. When a node doesn't join the cluster or has a network issue, you cannot just SSH in and run `journalctl -f` or check `/var/log/syslog`. You have to get used to using `talosctl logs`, `talosctl dmesg`, and reading machine configs carefully. 
 
-The cost is a higher skill floor. Diagnosis relies on `talosctl logs`, `talosctl dmesg`, `talosctl read`, and careful reading of patch files. If you are used to `ssh node && journalctl -f`, the learning curve is real. Immutability does not make debugging easier — it makes it *different*, and in some ways more demanding.
+It took me a while to stop instinctively reaching for an SSH client, but once you build the muscle memory for the Talos CLI, you realize how much cleaner it is to manage nodes as code.
 
-**Key takeaway:** Immutability is a genuine operational improvement, but it front-loads expertise requirements.
+## Being honest about the current gaps
 
-### 5. The two-layer approach (Terraform → ArgoCD) works, but the seam must stay consistent
+Too many homelab write-ups pretend everything is 100% perfect. My lab still has some rough edges that I haven't gotten around to fixing yet:
 
-**Terraform** owns infrastructure: VMs, Talos config, and the initial Cilium and ArgoCD installs. **ArgoCD** owns everything above that. The boundary is deliberate.
+Internal networking is still mostly flat. I have Cilium installed and Hubble running, but I haven't written strict `CiliumNetworkPolicy` rules to isolate namespaces from each other yet.
 
-But the seam carries obligations. ArgoCD's repo credentials are injected as a Kubernetes Secret by Terraform at bootstrap, and the OpenBao AppRole `secret_id` is passed as a Terraform variable. If these drift from what ArgoCD or ESO expects, failures are not obvious.
+Terraform state is sitting on my NAS unencrypted. It contains sensitive credentials from the bootstrap process, which is a security gap I need to close with proper backend encryption.
 
-The Cilium timing issue is the clearest example. Cilium is installed by Terraform via Helm, but its CRDs were not reliably ready when Terraform moved on. The fix was a **300-second `time_sleep`** — ugly but predictable, and a sign of how hard it is to wait for CRD readiness in Terraform without a proper polling mechanism.
+OpenBao was set up manually. While the Kubernetes cluster is 100% code, the OpenBao instance running on a separate VM was configured by hand. If that VM dies, I have to restore it from a Proxmox backup rather than spinning it up with Terraform.
 
-**Key takeaway:** Boundaries have interfaces, and interfaces need to be explicit, documented, and tested. The rebuild drill exercises the Terraform→ArgoCD handoff every time.
+The AppRole secret ID does not expire. I set `secret_id_ttl=0` during initial setup so I wouldn't have to deal with token rotation while getting the cluster off the ground. It works, but it needs to be rotated properly.
 
-### 6. Race conditions are real, even at homelab scale
+No CI pipeline checking manifests before commit. Right now I don't run `kubeconform` or `kustomize build` in GitHub Actions before pushing. If I make a typo in a manifest, I only find out when ArgoCD goes red.
 
-I hit three distinct race conditions:
+## What this actually gives you
 
-- **Cilium CRD timing:** dependent resources referenced CRDs that were not ready (fixed with `time_sleep`)
-- **ESO CRD sync wave:** ExternalSecrets resources applied before the CRDs had synced (fixed by correcting the sync wave)
-- **API readiness:** Terraform needed to wait for the Kubernetes API after etcd bootstrap before proceeding
+The whole point of running a lab like this is getting comfortable with how systems behave when things go wrong. 
 
-Kubernetes reconciles in parallel, which surfaces these races quickly. Small scale does not protect you; fewer nodes and less headroom can make timing margins tighter.
+It is easy to get overwhelmed by all the tools in the cloud native ecosystem. You hear people talk about GitOps, immutable infrastructure, eBPF, and secrets operators, and it feels like an impossible mountain to climb. But when you break it down into small pieces, build it by hand, and break it on purpose, it stops being mysterious.
 
----
-
-## Known Gaps (Being Honest)
-
-I would rather document these than pretend they do not exist:
-
-- **No `NetworkPolicy` or `CiliumNetworkPolicy` yet.** Hubble is enabled but not used for flow visibility or policy generation, so internal networking is flat.
-- **Terraform state is unencrypted on the NAS.** It contains sensitive values.
-- **OpenBao is configured by hand.** It is not codified with Terraform or OpenTofu and is the most manual component.
-- **AppRole `secret_id_ttl=0` (never expires).** TTL-bound secret IDs with rotation are planned.
-- **No CI validation.** GitOps PRs are not checked with `kustomize build` or `kubeconform`; errors surface at sync time.
-- **Off-site NAS restore never tested.** MinIO zvol coverage in cloud replication is unconfirmed.
-
----
-
-## What I Would Do Differently
-
-- **Use OpenTofu with native state encryption from day one.** Retrofitting it is harder than starting with it.
-- **Build a Kustomize restore overlay.** Restoring a CNPG database currently means committing a `restore-db.yaml` before the first ArgoCD sync. An `overlays/restore/` that patches the base cluster definition would be safer and repeatable.
-- **Add CI validation** (`kustomize build` + `kubeconform`) on every PR to the GitOps repo.
-- **Use TTL-bound AppRole secret IDs with rotation.**
-- **Use a DevContainer for the bootstrap environment.** Stale Helm repos on the provisioning machine caused a drill failure; pinned tool versions would remove that class of problem.
-
----
-
-## What's Next
-
-In rough priority order:
-
-1. **Network policies:** generate a baseline from Hubble flow data, then harden progressively
-2. **Secrets hygiene:** TTL-bound AppRole secret IDs; consider codifying OpenBao configuration
-3. **CI validation:** `kustomize build` + `kubeconform` on GitOps PRs
-4. **Upgrade rehearsal:** documented Talos and Kubernetes version upgrades
-5. **Replace MinIO:** evaluate alternatives, since zvol cloud replication coverage is unconfirmed
-
----
-
-## What This Demonstrates
-
-The point of this project is not the tool list. Talos, ArgoCD, Cilium, and OpenBao are tools. The point is the *habits*:
-
-- **I drill.** Not once and not untimed. Drill 2 found three bugs; drill 3 validated the fixes.
-- **I document gaps I have not fixed.** Unencrypted state, non-expiring secret IDs, and missing network policies are written down, not hidden.
-- **I iterate on measurements.** 70 minutes to 33 minutes is data, not a guess.
-- **I write things down.** Runbooks, gap analysis, and architecture decisions, because a system only one person can operate is not production-grade.
-
-Building with production habits in a homelab means accepting that you will never have all the time or resources to do everything right — but you can be honest about what is not done, have a plan for it, and keep iterating.
+You don't need a massive budget or enterprise gear to build good habits. You just need some patience, backups of your data, and the willingness to let things crash so you can learn how to put them back together.

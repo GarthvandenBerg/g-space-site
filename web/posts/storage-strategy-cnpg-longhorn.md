@@ -1,100 +1,81 @@
 ---
-title: Storage Strategy — Matching Storage Class to Workload Failure Model
+title: Kubernetes Storage in My Homelab: Local-Path, Longhorn, and NFS
 date: 2026-11-22
-readTime: 7
+readTime: 8
 tags: homelab, kubernetes, storage, infrastructure
-summary: Not all storage classes are equal — the right choice depends on how your workload already handles failure. Here's how local-path, Longhorn, and NFS are used across this Talos Linux homelab cluster, and why.
+summary: Why putting your databases on distributed block storage is usually a mistake, and how I split storage across local SSDs, Longhorn, and TrueNAS.
 ---
 
-**TL;DR:** Storage class selection is a *failure-domain decision*, not just a capacity decision. This post walks through the three storage backends in use — `local-path`, Longhorn, and NFS from TrueNAS — explains why each workload lands where it does, and covers the trade-offs that come with each choice.
+When people first get into Kubernetes storage, the instinct is usually to find a distributed storage operator like Longhorn or Ceph, deploy it across every node, and point every single PersistentVolumeClaim at it. 
 
-## The Core Question: What Breaks When a Node Dies?
+It sounds great in theory: every volume is replicated across the network, and if a node explodes, your pod can just start up on another node with its data intact.
 
-Before picking a storage class, ask one question: *what happens to this workload's data when the node it's running on becomes unavailable?*
+In practice, blindly putting everything on distributed storage is an easy way to kill your disk performance and waste system resources. Different applications handle failures in completely different ways, and your storage should match what the workload actually needs.
 
-The answer determines everything. A workload that replicates its own data at the application layer has fundamentally different storage needs than one that relies on the infrastructure to keep data available. Treating every PVC the same leads to either wasted overhead (double-replication) or silent single points of failure.
+In my five-node Talos cluster, I have three control planes and two worker nodes. Since workloads only run on the two workers, I have to be very deliberate about where data lands. 
 
-This cluster runs on **5 Talos Linux nodes** (3 control planes + 2 workers) across 2 Proxmox VE hosts. Control planes are not schedulable, so workloads land on the 2 worker nodes. With only 2 workers, every storage and scheduling decision has to be deliberate.
+Here is how I split storage between `local-path`, Longhorn, and TrueNAS NFS, and why each workload ended up where it did.
 
-## Three Storage Classes, Three Failure Models
+## 1. Local-path: fast, pinned, and perfect for databases
 
-### 1. `local-path` — Node-Local, Fast, Intentionally Pinned
+The `local-path` provisioner writes files directly to the local NVMe SSD on the node running the pod. There is zero network latency, no background synchronization, and no distributed controller overhead. It is as fast as bare metal disk I/O gets.
 
-`local-path` provisioner writes data directly to the node's local disk. No replication, no network I/O, no storage controller overhead. It's the fastest option and also the most opinionated: the data is permanently tied to one node.
+The catch is obvious: data on a `local-path` volume is permanently stuck to that specific machine. If the node dies, the data on that drive is gone until the machine comes back online.
 
-**This is the storage class for all CloudNative-PG (CNPG) databases.**
+That sounds terrifying for important data, but it is actually the best choice for all my Postgres databases managed by CloudNativePG (CNPG).
 
-That choice is deliberate. CNPG already handles its own replication at the application layer:
+Here is why: CNPG already handles its own database replication at the application layer.
 
-- Each database cluster runs **2 instances** (primary + replica).
-- `podAntiAffinity: required` ensures the two pods land on *different* worker nodes.
-- If the node hosting the primary dies, CNPG promotes the replica to primary — no volume migration needed.
+- Every database cluster runs two instances: a primary and a replica.
+- Strict `podAntiAffinity` rules force the two database pods to land on different worker nodes.
+- If the worker running the primary node catches fire, CNPG promotes the standby replica on the other worker to primary within seconds.
 
-Given that, adding Longhorn's block-level replication would mean **replication-on-replication**: data written once at the application layer, written again by the storage layer. That adds write latency, extra disk I/O, and CPU overhead for no additional durability benefit. CNPG's replica is already on a different node with its own independent local-path volume.
+If I put CNPG databases on Longhorn, I would be paying for replication twice. The database writes the transaction to the replica over the network, and then Longhorn writes the underlying block storage to the other node over the network again. That just burns CPU, doubles network traffic, and tanks write IOPS for no extra safety.
 
-The trade-off is explicit: each instance's data is pinned to one node's disk. If that disk fails and there is no replica to promote, data loss is possible. The mitigation is **Barman/WAL backups to MinIO S3** (`s3://database-backup/<db>`), with scheduled backups staggered across the night and WAL archiving with gzip compression running continuously.
+Instead, I give CNPG raw local SSDs. If a worker goes down, the standby database takes over. If both workers die, Barman restores the database from MinIO S3 backups where write-ahead logs stream continuously. 
 
-```yaml
-# CNPG cluster — storage and anti-affinity
-storage:
-  size: 10Gi
-  storageClass: local-path
+I run four databases this way (`immich-db`, `authentik-db`, `coroot-db`, and `grafana-db`), and performance has been rock solid.
 
-affinity:
-  podAntiAffinityType: required
-```
+## 2. Longhorn: replicated block storage for single-instance apps
 
-Databases in use: `coroot-db`, `immich-db`, `authentik-db`, and `grafana-db` — all in the `database-system` namespace, all on `local-path`.
+Longhorn comes in when an application cannot replicate its own data and needs its volume to survive a node crash.
 
-### 2. Longhorn — Replicated Block Storage, Waiting for the Right Workload
+I run Longhorn with a replica count of 2 across my two worker nodes, with backups scheduled daily to an S3 bucket at `s3://pvc-backup/longhorn/`.
 
-**Longhorn** provides replicated block storage across the worker nodes. It's installed, configured, and backing one workload in production: the **Minecraft server's persistent world data**.
+The best example of where Longhorn makes sense is our Minecraft server. 
 
-Configuration:
+Minecraft is a single-instance Java application with zero built-in clustering or replication. If the worker node running Minecraft crashes, Kubernetes will reschedule the pod over to the surviving worker. Because the world save data lives on a replicated Longhorn volume, the pod attaches the volume on the new node and boots the server without losing our builds.
 
-- **2 replicas** (constrained by having 2 worker nodes — that's the maximum meaningful replica count)
-- **Backup target:** `s3://pvc-backup/longhorn/`
-- **Daily RecurringJob** at 02:00 for the `app-data` group
-- `storageOverProvisioningPercentage: 500`
-- `dataLocality: best-effort`
-- `allowSchedulingOnControlPlaneNodes: false`
+Prometheus also uses a 50 GB Longhorn volume for its 60-day metric history. Metrics can be re-scraped if disaster hits, but having the volume follow the pod across worker reboots keeps monitoring graphs from developing annoying gaps.
 
-Longhorn is the right choice when the application *doesn't* replicate its own data and you need a PVC to survive a node failure without manual intervention. The Minecraft world is a good fit: it's a single-instance workload with no built-in replication, and the world data needs to follow the pod if it reschedules to the other worker.
+### Why I kicked Longhorn out of Terraform
 
-**Why Longhorn was removed from the Terraform bootstrap:**
+When I first set up the cluster, I tried to install Longhorn with Helm directly inside Terraform alongside Cilium and ArgoCD. 
 
-Early in the cluster build, Longhorn was provisioned directly by Terraform alongside Cilium and ArgoCD. This ran into a CRD/controller race condition: Longhorn's CRDs weren't reliably registered before the controller tried to use them during initial provisioning. The fix was to remove Longhorn from Terraform entirely and let **ArgoCD manage it** after the cluster is stable. Terraform now bootstraps Cilium, waits (with a `time_sleep` of 300 seconds for CRD readiness), installs ArgoCD, and applies the root app — Longhorn comes up through GitOps from there.
+That was a mistake. Longhorn installs a massive collection of custom resource definitions and background controllers. Terraform kept racing ahead and trying to configure volumes before the Longhorn API was actually ready to receive requests, leading to random bootstrap failures.
 
-This is a pattern worth remembering: **Helm + Terraform is not always the right tool for CRD-heavy operators**. GitOps with sync waves gives you explicit ordering guarantees that Terraform's dependency graph can't easily replicate for in-cluster resources.
+I fixed this by removing Longhorn from Terraform completely and letting ArgoCD manage it via GitOps. Terraform now bootstraps the bare cluster, installs Cilium, waits for the API to settle, and hands off to ArgoCD. ArgoCD uses sync waves to deploy Longhorn cleanly once the foundation is stable. 
 
-Prometheus also uses a **50 Gi Longhorn PVC** for its 60-day metric retention — this is an observability workload where the data is regenerated from scraping anyway, so Longhorn's replication provides availability without meaningful durability requirements.
+Terraform is great for provisioning infrastructure, but for complex, CRD-heavy operators, GitOps sync waves give you much better control over startup ordering.
 
-### 3. NFS from TrueNAS — High Capacity, ZFS-Backed, Single Point of Failure
+## 3. TrueNAS NFS: bulk storage for family photos
 
-**Immich** (self-hosted photo library) stores photos on an NFS share exported from a **TrueNAS SCALE** host running a ZFS pool. This gives large capacity and takes advantage of ZFS's native snapshot capability, with off-site replication to Backblaze B2.
+For my photo library on Immich, neither local SSDs nor Longhorn made sense. 
 
-Immich's metadata and database run on CNPG (`immich-db` on `local-path`). The photo *files* live on NFS because they're large, write-once, and need to outlive any single Kubernetes node or pod restart.
+Immich stores thousands of high-resolution photos and family video clips. Storing hundreds of gigabytes of media files inside replicated Kubernetes block volumes would fill up the worker node SSDs in no time.
 
-**The trade-off:** TrueNAS is a **single point of failure** for Immich's photo data. If the TrueNAS host is unavailable, Immich degrades — the application pod can run, but it can't serve or ingest photos. The mitigation is ZFS snapshots plus B2 replication, but recovery from a full TrueNAS loss would require restoring from B2 and is a path that hasn't been fully drilled yet.
+Instead, the Immich photo library lives on an NFS share exported from a TrueNAS SCALE box running a dedicated ZFS pool. 
 
-This is a known and accepted limitation. For a homelab, the operational simplicity of a single NAS with ZFS outweighs the complexity of running distributed object storage for unstructured photo data.
+This keeps bulk media off the Kubernetes nodes and takes advantage of ZFS features: native snapshots, data integrity checks, and scheduled off-site replication to Backblaze B2. Immich's database and metadata still live on fast local SSDs with CNPG, but the actual photo files sit on TrueNAS.
 
-## Storage Class Decision Summary
+The trade-off here is that TrueNAS is a single point of failure for the photo library. If the TrueNAS box is powered off for maintenance, the Immich web app will run, but users won't be able to view or upload photos. For a homelab, that is a reasonable trade-off to keep storage management simple and centralized.
 
-| Storage Class | Workloads | Why |
-|---|---|---||
-| `local-path` | CNPG databases | App-layer replication; highest IOPS; Barman S3 backups |
-| Longhorn | Minecraft world, Prometheus metrics | No app-layer replication; needs pod-portable PVC |
-| NFS (TrueNAS) | Immich photos | Large unstructured files; ZFS snapshots + B2 offsite |
+## The takeaway on storage
 
-## What I Learned
+Don't assume you need to run every volume through distributed storage just because you are on Kubernetes. 
 
-**Storage class is a failure-domain decision.** The question isn't "which storage class performs best" or "which one has the most features" — it's "how does this workload already handle failure, and what does it need from storage to maintain its guarantees?"
+If your application already knows how to cluster and replicate itself (like modern database operators), give it fast local disk and let the app do its job. 
 
-For CNPG, local-path is the correct choice *because* CNPG is opinionated about replication. Adding Longhorn would be cargo-culting "distributed storage" onto a workload that already manages its own distribution. The result would be higher latency and more complexity for the same failure characteristics.
+Save distributed storage like Longhorn for single-instance tools that need their disks to follow them between nodes. 
 
-For single-instance workloads like Minecraft, Longhorn earns its overhead: without it, a node failure means waiting for manual data recovery before the pod can restart elsewhere.
-
-For large unstructured files tied to a specific host's storage capacity, NFS is pragmatic — with eyes open to the single-point-of-failure trade-off.
-
-The Longhorn CRD race condition during Terraform bootstrap was a concrete lesson in the **limits of Terraform for in-cluster lifecycle management**. Terraform is excellent at infrastructure provisioning; it's not a Kubernetes controller. Sync waves in ArgoCD handle ordering concerns that Terraform simply wasn't designed to express.
+And for bulk media, a solid NAS running ZFS with external backups is almost always easier to manage than trying to cram terabytes of photos into container volumes.
