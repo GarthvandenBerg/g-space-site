@@ -51,7 +51,8 @@
   }
 
   // ---------- Markdown (small, safe subset) ----------
-  // Supports: headings, paragraphs, **bold**, *italic*, `code`, [links](url),
+  // Supports: headings, paragraphs, **bold**, *italic*, ~~strike~~, `code`, [links](url),
+  // horizontal rules / dividers (---, ***, ___), tables (GFM),
   // fenced code blocks, bullet/numbered lists, blockquotes.
   // All raw HTML in posts is escaped, so a post can never inject markup.
   function renderInline(text) {
@@ -63,7 +64,10 @@
     });
     s = s
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/__([^_]+)__/g, '<strong>$1</strong>')
       .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>')
+      .replace(/(^|[^_])_([^_\s][^_]*)_/g, '$1<em>$2</em>')
+      .replace(/~~([^~]+)~~/g, '<del>$1</del>')
       .replace(
         /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*|#[^\s)]*)\)/g,
         '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
@@ -71,11 +75,43 @@
     return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codeSpans[i]}</code>`);
   }
 
+  // Thematic break: 3 or more -, *, or _ with optional whitespace
+  function isThematicBreak(l) {
+    return /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(l);
+  }
+
+  // Table delimiter row: e.g. |---|:---:|---:| or ---|---
+  function isTableDelimiter(l) {
+    if (!l || !l.includes('|') || !l.includes('-')) return false;
+    const inner = l.trim().replace(/^\|+|\|+$/g, '');
+    if (!inner) return false;
+    const cells = inner.split('|');
+    return cells.length > 0 && cells.every((c) => /^\s*:?-{1,}:?\s*$/.test(c));
+  }
+
+  function isTableStart(l, nextL) {
+    return Boolean(l && l.includes('|') && nextL && isTableDelimiter(nextL));
+  }
+
+  function splitTableRow(line) {
+    const placeholder = '\u0000';
+    let clean = line.trim().replace(/\\\|/g, placeholder);
+    clean = clean.replace(/`[^`]+`/g, (m) => m.replace(/\|/g, placeholder));
+    const inner = clean.replace(/^\|+|\|+$/g, '');
+    return inner.split('|').map((c) => c.replace(/\u0000/g, '|').trim());
+  }
+
   function renderMarkdown(md) {
     const lines = md.replace(/\r\n/g, '\n').split('\n');
     const out = [];
-    const isBlockStart = (l) =>
-      /^```/.test(l) || /^#{1,4}\s/.test(l) || /^\s*[-*]\s+/.test(l) || /^\s*\d+\.\s+/.test(l) || /^>/.test(l);
+    const isBlockStart = (l, nextL) =>
+      /^```/.test(l) ||
+      /^#{1,6}\s/.test(l) ||
+      isThematicBreak(l) ||
+      isTableStart(l, nextL) ||
+      /^\s*[-*+]\s+/.test(l) ||
+      /^\s*\d+\.\s+/.test(l) ||
+      /^>/.test(l);
     let i = 0;
 
     while (i < lines.length) {
@@ -95,20 +131,84 @@
         continue;
       }
 
+      // Thematic break / horizontal rule (---, ***, ___)
+      if (isThematicBreak(line)) {
+        out.push('<hr>');
+        i++;
+        continue;
+      }
+
       // Heading (# and ## both become h2 because the post title is the h1)
-      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
       if (h) {
-        const level = Math.max(2, h[1].length);
+        const level = Math.min(6, Math.max(2, h[1].length));
         out.push(`<h${level}>${renderInline(h[2])}</h${level}>`);
         i++;
         continue;
       }
 
+      // Table (GFM style)
+      if (isTableStart(line, lines[i + 1])) {
+        const headerCells = splitTableRow(line);
+        const delimiterCells = splitTableRow(lines[i + 1]);
+        const alignments = delimiterCells.map((c) => {
+          const t = c.trim();
+          const left = t.startsWith(':');
+          const right = t.endsWith(':');
+          if (left && right) return 'center';
+          if (right) return 'right';
+          if (left) return 'left';
+          return '';
+        });
+
+        i += 2; // skip header and delimiter rows
+
+        const bodyRows = [];
+        while (
+          i < lines.length &&
+          lines[i].trim() &&
+          lines[i].includes('|') &&
+          !isThematicBreak(lines[i]) &&
+          !/^```/.test(lines[i]) &&
+          !/^#{1,6}\s/.test(lines[i]) &&
+          !(bodyRows.length > 0 && isTableDelimiter(lines[i + 1]))
+        ) {
+          bodyRows.push(splitTableRow(lines[i]));
+          i++;
+        }
+
+        const getAlignStyle = (idx) => {
+          const a = alignments[idx];
+          return a ? ` style="text-align: ${a};"` : '';
+        };
+
+        const ths = headerCells
+          .map((c, idx) => `<th${getAlignStyle(idx)}>${renderInline(c)}</th>`)
+          .join('');
+        const thead = `<thead><tr>${ths}</tr></thead>`;
+
+        const trs = bodyRows
+          .map((row) => {
+            const tds = headerCells
+              .map((_, idx) => {
+                const cell = row[idx] !== undefined ? row[idx] : '';
+                return `<td${getAlignStyle(idx)}>${renderInline(cell)}</td>`;
+              })
+              .join('');
+            return `<tr>${tds}</tr>`;
+          })
+          .join('');
+        const tbody = `<tbody>${trs}</tbody>`;
+
+        out.push(`<div class="table-container"><table>${thead}${tbody}</table></div>`);
+        continue;
+      }
+
       // Bullet list
-      if (/^\s*[-*]\s+/.test(line)) {
+      if (/^\s*[-*+]\s+/.test(line)) {
         const items = [];
-        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-          items.push(`<li>${renderInline(lines[i].replace(/^\s*[-*]\s+/, ''))}</li>`);
+        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]) && !isThematicBreak(lines[i])) {
+          items.push(`<li>${renderInline(lines[i].replace(/^\s*[-*+]\s+/, ''))}</li>`);
           i++;
         }
         out.push(`<ul>${items.join('')}</ul>`);
@@ -136,8 +236,12 @@
 
       // Paragraph
       const buf = [];
-      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) buf.push(lines[i++]);
-      out.push(`<p>${renderInline(buf.join(' '))}</p>`);
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i], lines[i + 1])) {
+        buf.push(lines[i++]);
+      }
+      if (buf.length > 0) {
+        out.push(`<p>${renderInline(buf.join(' '))}</p>`);
+      }
     }
 
     return out.join('\n');
@@ -153,7 +257,7 @@
 
   function parsePost(slug, raw) {
     const text = raw.replace(/\r\n/g, '\n');
-    const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+    const match = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
     const meta = {};
     let body = text;
 
@@ -168,7 +272,7 @@
     body = body.trim();
     const words = body.split(/\s+/).filter(Boolean).length;
     const firstPara = body.split(/\n\s*\n/)[0] || '';
-    const plainFirst = firstPara.replace(/[`*#>\[\]()]/g, '').replace(/\s+/g, ' ').trim();
+    const plainFirst = firstPara.replace(/[`*#>\[\]()|]/g, '').replace(/\s+/g, ' ').trim();
 
     const tagList = parseTags(meta.tags);
 

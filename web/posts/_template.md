@@ -11,10 +11,20 @@ Write the post in Markdown. Files starting with an underscore are ignored.
 
 ## A heading
 
-Normal paragraphs, **bold**, *italic*, `inline code` and [links](https://example.com).
+Normal paragraphs, **bold**, *italic*, ~~strikethrough~~, `inline code` and [links](https://example.com).
+
+---
+
+## Lists and tables
 
 - Bullet lists
 - Work too
+
+| Host | Role | Notes |
+|:---|:---:|---:|
+| **kirk** | Primary host | Runs 2 control planes + 1 worker |
+| **picard** | Secondary host | Runs 1 control plane + 1 worker |
+| **QDevice** | Quorum device | Runs external monitoring |
 
 ```yaml
 securityContext:
